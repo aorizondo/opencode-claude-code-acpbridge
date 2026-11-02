@@ -6,7 +6,7 @@
 
 /** Oldest `@agentclientprotocol/claude-agent-acp` the bridge is tested with: session
  *  fork (smart revert, profile switches), `session/close`, in-place model switching
- *  and prompt queueing all come from it. */
+ *  and prompt queueing all come from it. Also tested with 0.99 (model as a config option). */
 export const MIN_AGENT_VERSION = "0.31.0";
 /** OpenCode V2 range the plugin supports (matches the `@opencode/plugin` peer range). */
 export const MIN_OPENCODE_VERSION = "2.0.14";

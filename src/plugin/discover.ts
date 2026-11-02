@@ -77,6 +77,7 @@ export async function discoverAgent(opts: DiscoverOptions): Promise<DiscoveredAg
         },
         async writeTextFile() { return {}; },
         async readTextFile() { return { content: "" }; },
+        async extNotification() { /* agent notices (_auth/status_update…): not ours */ },
       }),
       stream,
     );
@@ -94,15 +95,17 @@ export async function discoverAgent(opts: DiscoverOptions): Promise<DiscoveredAg
       _meta: { claudeCode: { options: buildClaudeCodeOptions(ctrl) } },
     });
 
-    const models: DiscoveredModel[] = (session?.models?.availableModels ?? []).map((m: any) => ({
-      id: m.modelId,
-      name: m.name,
-      description: m.description ?? undefined,
-    }));
+    // claude-agent-acp ≥ 0.99 dropped `models` (and session/set_model): the model is a
+    // `model` config option like effort, with the same choices.
+    const modelOption = (session?.configOptions ?? []).find((o: any) => o?.id === "model");
+    const models: DiscoveredModel[] = session?.models?.availableModels
+      ? session.models.availableModels.map((m: any) => ({ id: m.modelId, name: m.name, description: m.description ?? undefined }))
+      : (modelOption?.options ?? []).map((o: any) => ({ id: o.value, name: o.name, description: o.description ?? undefined }));
     const modes = (session?.modes?.availableModes ?? []).map((m: any) => ({ id: m.id, name: m.name }));
+    const currentModelId = session?.models?.currentModelId ?? modelOption?.currentValue;
 
     dbg(`agent ${agentVersion} → models: ${models.map((m) => m.id).join(", ") || "(none)"} | caps: ${JSON.stringify(promptCaps)}`);
-    return { models, modes, promptCaps, currentModelId: session?.models?.currentModelId, agentVersion };
+    return { models, modes, promptCaps, currentModelId, agentVersion };
   })();
 
   try {

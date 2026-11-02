@@ -100,6 +100,9 @@ const CHECKPOINT_NOTE =
   "<context_update>\n(The conversation continued in OpenCode with another model and was then compacted. " +
   "OpenCode's checkpoint follows: it summarizes everything, including what happened after your last turn. " +
   "Keep what you remember; use it to catch up on what you did not see.)\n</context_update>";
+/** Session updates only a turn that actually runs produces (not the command/config
+ *  notices an agent sends on its own). */
+const TURN_UPDATES = new Set(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "usage_update", "plan"]);
 /** How long a turn being replaced may take to wind down after a cancel. */
 const SETTLE_MS = 5000;
 /** The `# Code Mode` section of OpenCode's system prompt (up to the next top-level
@@ -223,6 +226,18 @@ interface TurnState {
   inflight: Promise<void> | null;
   /** The prompt finished while no stream was attached: finish the next one with it. */
   doneResp: any | null;
+  /** Same for a FAILED prompt (usage limit, API error…): the next stream of the turn
+   *  fails with it. Dropping it left OpenCode waiting on a turn that was already over. */
+  doneErr: unknown;
+  /** A prompt failed agent-side. claude-agent-acp stops reading the turn at the error and
+   *  leaves its trailing `idle` queued: the next prompt would take it as its own end and
+   *  return at once, empty, while the real answer runs unread. The session is re-opened
+   *  in a new agent process (context kept) before the next prompt. */
+  resync: boolean;
+  /** Content updates received since the latest prompt was sent (see `isStale`). */
+  genEvents: number;
+  /** Re-open the session in place with the profile of the latest turn (`reopener`). */
+  reopen: ((why: string) => Promise<boolean>) | null;
   /** The turn was aborted (stream cancelled / tool interrupted): its tail is discarded. */
   aborted: boolean;
   /** Tool-calls / permission questions collected for the step being closed. */
@@ -427,6 +442,8 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
   private promptCaps: Record<string, boolean> = {};
   /** The agent merges a prompt sent mid-turn into the running turn (claude-agent-acp). */
   private promptQueueing = false;
+  /** The agent has no session/set_model: models go through the `model` config option. */
+  private modelByConfig = false;
 
   constructor(private readonly config: ACPModelConfig) {
     this.modelId = config.modelId ?? "claude-code";
@@ -534,8 +551,11 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           t.host.resolveToolCall(toolCallId, piggyback && i === lastTool ? this.appendToResult(result, extraBlocks) : result);
         });
         if (extraBlocks.length && !piggyback) this.sendPrompt(t, extraBlocks);
+        // The prompt already failed (usage limit hit while OpenCode ran the step): nothing
+        // will continue this turn — fail it now instead of leaving OpenCode waiting.
+        if (t.doneErr) this.failFromDone(t);
         // Calls that arrived while OpenCode ran the previous step go out now as the next one.
-        if (t.queuedItems.length) {
+        else if (t.queuedItems.length) {
           t.stepItems.push(...t.queuedItems);
           t.queuedItems = [];
           this.closeStep(t);
@@ -628,6 +648,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     // (2) Reuse the live session whenever we can — this is what keeps the cache warm.
     if (t) {
       let drop: string | null = null;
+      if (t.compacting) await Promise.race([t.compacting, new Promise((r) => setTimeout(r, COMPACT_WAIT_MS))]);
       if (t.systemKey !== systemKey) drop = "system prompt changed";
       else if (t.cfgKey !== cfgKey) {
         // Another agent profile (native tools, allowed tools, setting sources…): those are
@@ -638,6 +659,11 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           drop = "creation config changed";
         }
       }
+      // The previous prompt failed agent-side: talk to a new agent process, not to the one
+      // still holding that turn's leftovers (see `resync`).
+      if (!drop && t.resync && !(await this.reopenInPlace(t, ctrl, tools, systemMode, options.prompt, cfgKey, "recovering after an agent error"))) {
+        drop = "agent session out of sync";
+      }
       if (!drop) {
         // A changed tool set is applied to the LIVE session (MCP list_changed)
         // rather than forcing a new one.
@@ -647,7 +673,6 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           t.toolsKey = toolsKey;
           dbg(`tools changed (${tools.length}) — refreshed in place, session kept`);
         }
-        if (t.compacting) await Promise.race([t.compacting, new Promise((r) => setTimeout(r, COMPACT_WAIT_MS))]);
         let cls = this.classify(t, hist, keys, ctrl, options);
         // v2: OpenCode's checkpoint replaced the history. Keep the session: either it
         // compacted itself in step (adopt — only what follows the checkpoint is new), or
@@ -688,6 +713,8 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           }
           live.pending = [];
           live.doneResp = null;
+          live.doneErr = null;
+          live.reopen = this.reopener(live, ctrl, tools, systemMode, options.prompt, cfgKey);
           live.controller = controller;
           live.lastActive = Date.now();
           live.isChild = isChildCall(options);
@@ -827,6 +854,10 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       gen: 0,
       inflight: null,
       doneResp: null,
+      doneErr: null,
+      resync: false,
+      genEvents: 0,
+      reopen: null,
       aborted: false,
       stepItems: [],
       stepTimer: null,
@@ -840,6 +871,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       lastActive: Date.now(),
     };
     ref.t = t;
+    t.reopen = this.reopener(t, ctrl, tools, systemMode, options.prompt, cfgKey);
     host.onToolCall((c) => this.onToolCall(t!, c));
     host.onToolCancelled((id) => this.onToolCancelled(t!, id));
     this.sessions.set(key, t);
@@ -901,6 +933,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       t.appliedMode = undefined; // re-applied on the fork by applySessionConfig
       t.appliedEffort = undefined;
       t.appliedModel = undefined;
+      t.resync = false; // a fork is a new agent process: nothing of the old one is queued
       host.onToolCall((c) => this.onToolCall(t, c));
       host.onToolCancelled((id) => this.onToolCancelled(t, id));
       this.byAcpSession.set(t.sessionId, t);
@@ -912,6 +945,74 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       host.stop();
       dbg(`fork of ${t.sessionId} failed (${e instanceof Error ? e.message : String(e)}) — new session instead`);
       return false;
+    }
+  }
+
+  /** `reopenInPlace` bound to the latest turn's profile, with its mode/model/effort
+   *  re-applied — for a recovery that happens outside `startFresh`. */
+  private reopener(
+    t: TurnState, ctrl: ClaudeCodeControl, tools: McpToolDef[], systemMode: string,
+    prompt: LanguageModelV3CallOptions["prompt"], cfgKey: string,
+  ): (why: string) => Promise<boolean> {
+    return async (why) => {
+      if (!(await this.reopenInPlace(t, ctrl, tools, systemMode, prompt, cfgKey, why))) return false;
+      await this.applySessionConfig(t, ctrl);
+      return true;
+    };
+  }
+
+  /** Re-open `t`'s agent session in a NEW agent process under the same id: close it and
+   *  resume it from its transcript. Whatever the old process still had queued is gone, and
+   *  unlike a fork no transcript copy is written (a retry loop would write one per try).
+   *  Falls back to a fork when the resume fails. */
+  private async reopenInPlace(
+    t: TurnState, ctrl: ClaudeCodeControl, tools: McpToolDef[], systemMode: string,
+    prompt: LanguageModelV3CallOptions["prompt"], cfgKey: string, why: string,
+  ): Promise<boolean> {
+    if (t.inflight || t.pendingTools.size || t.pendingPermissions.size) {
+      this.abortTurn(t, why);
+      await this.settle(t);
+    }
+    const idPrefix = `acp_${randomBytes(5).toString("hex")}_`;
+    const host = new McpHost("opencode", idPrefix);
+    try {
+      await host.start();
+      host.setTools(tools);
+      // Awaited: resuming an id the agent still holds would hand back the same process.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.resolve(this.connection.extMethod?.("session/close", { sessionId: t.sessionId })).catch(() => { /* older agent */ }),
+        new Promise<void>((r) => { timer = setTimeout(r, SETTLE_MS); }),
+      ]);
+      clearTimeout(timer);
+      const meta: any = { claudeCode: { options: buildClaudeCodeOptions(ctrl) } };
+      const sysMeta = this.buildSystemPromptMeta(prompt, systemMode);
+      if (sysMeta !== undefined) meta.systemPrompt = sysMeta;
+      const res = await this.connection.unstable_resumeSession({
+        sessionId: t.sessionId,
+        cwd: this.config.cwd ?? process.cwd(),
+        mcpServers: [host.getServerConfig()],
+        _meta: meta,
+      });
+      const oldHost = t.host;
+      t.host = host;
+      t.idPrefix = idPrefix;
+      t.ownPrefixes = [idPrefix, ...t.ownPrefixes].slice(0, 8);
+      t.cfgKey = cfgKey;
+      t.appliedMode = undefined; // re-applied on the new process by applySessionConfig
+      t.appliedEffort = undefined;
+      t.appliedModel = undefined;
+      t.defaultEffort = effortOption(res) ?? t.defaultEffort;
+      t.resync = false;
+      host.onToolCall((c) => this.onToolCall(t, c));
+      host.onToolCancelled((id) => this.onToolCancelled(t, id));
+      oldHost.stop();
+      note(`session ${t.sessionId} re-opened in a new agent process (${why}, context kept)`);
+      return true;
+    } catch (e) {
+      host.stop();
+      dbg(`re-open of ${t.sessionId} failed (${e instanceof Error ? e.message : String(e)}) — forking instead`);
+      return this.forkInPlace(t, ctrl, tools, systemMode, prompt, cfgKey, undefined, why);
     }
   }
 
@@ -986,7 +1087,10 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       .prompt({ sessionId: t.sessionId, prompt: [{ type: "text", text: "/compact" }] })
       .then(
         () => { if (gen === t.gen) t.adoptCheckpoint = true; },
-        (e: any) => dbg(`native /compact failed: ${errorText(e)}`),
+        (e: any) => {
+          note(`native /compact of ${t.sessionId} failed (${errorText(e)}) — the session is re-opened on the next turn`);
+          t.resync = true;
+        },
       )
       .finally(() => {
         t.hidden = false;
@@ -1099,16 +1203,21 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
   /** Send a prompt as the session's newest generation. Completions of older ones — a
    *  cancelled turn, or the original prompt the agent resolves early when it merges a
    *  queued one — are ignored instead of closing the stream of the current turn. */
-  private sendPrompt(t: TurnState, blocks: any[]) {
+  private sendPrompt(t: TurnState, blocks: any[], retry = true) {
+    // An empty prompt (nothing new to say) may legitimately run nothing.
+    if (!blocks.some((b) => b?.type !== "text" || b.text)) retry = false;
     const gen = ++t.gen;
     t.aborted = false;
     t.doneResp = null;
+    t.doneErr = null;
+    t.genEvents = 0;
     const settled = this.connection
       .prompt({ sessionId: t.sessionId, prompt: blocks })
       .then(
         (resp: any) => {
-          if (gen === t.gen) this.onPromptDone(t, resp);
-          else dbg(`stale prompt completion ignored (gen ${gen} < ${t.gen}, ${resp?.stopReason})`);
+          if (gen !== t.gen) { dbg(`stale prompt completion ignored (gen ${gen} < ${t.gen}, ${resp?.stopReason})`); return; }
+          if (retry && this.isStale(t, resp)) return this.recoverStale(t, blocks);
+          this.onPromptDone(t, resp);
         },
         (err: any) => {
           if (gen === t.gen) this.onPromptError(t, err);
@@ -1117,6 +1226,38 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       )
       .then(() => { if (t.inflight === settled) t.inflight = null; });
     t.inflight = settled;
+  }
+
+  /** The agent ended the prompt on a turn-over left queued by an EARLIER turn (see
+   *  `resync`): `end_turn` with nothing streamed and a usage of exactly zero — a turn that
+   *  ran always bills a request. An agent that reports no usage is never flagged. */
+  private isStale(t: TurnState, resp: any): boolean {
+    const u = resp?.usage;
+    if (resp?.stopReason !== "end_turn" || t.genEvents > 0 || !u || typeof u !== "object") return false;
+    return !(u.inputTokens || u.outputTokens || u.cachedReadTokens || u.cachedWriteTokens);
+  }
+
+  /** The prompt "finished" without running and its real turn now runs unread. Stop it,
+   *  re-open the session and send the prompt again on the SAME stream, so OpenCode only
+   *  sees a slower answer instead of an empty one. Once per prompt. */
+  private async recoverStale(t: TurnState, blocks: any[]) {
+    note(`session ${t.sessionId}: the agent ended a turn it never ran (leftover of an earlier turn) — re-opening the session`);
+    // Stop the unread run (agent-side cancel, its calls released) but keep the stream.
+    const controller = t.controller;
+    this.abortTurn(t, "turn the agent never ran");
+    t.aborted = false;
+    // reopenInPlace checks for a busy turn synchronously, before its first await: hide
+    // this one from that check only. Kept in flight otherwise, so a user turn arriving
+    // meanwhile waits for the recovery (and cancels it) instead of racing it.
+    const inflight = t.inflight;
+    t.inflight = null;
+    const reopening = t.reopen?.("recovering a turn the agent never ran");
+    t.inflight = inflight;
+    const ok = (await reopening) ?? false;
+    if (this.sessions.get(t.key) !== t || t.aborted) return; // ended, or the user cancelled meanwhile
+    t.controller = controller;
+    if (ok) this.sendPrompt(t, blocks, false);
+    else this.onPromptError(t, new Error("Claude Code: the agent session went out of sync and could not be re-opened. Send the message again."));
   }
 
   /** Wait (bounded) for the running prompt to settle — e.g. after a cancel. */
@@ -1143,6 +1284,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     t.textAcc.clear();
     t.pending = [];
     t.doneResp = null;
+    t.doneErr = null;
     if (t.stepTimer) { clearTimeout(t.stepTimer); t.stepTimer = null; }
     t.stepItems = [];
     t.queuedItems = [];
@@ -1206,14 +1348,26 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     if (/process exited unexpectedly|session not found/i.test(errorText(err))) {
       note(`session ${t.sessionId} lost agent-side — the next turn resumes it`);
       queueMicrotask(() => this.endTurn(t));
+    } else {
+      t.resync = true;
     }
-    if (!t.controller) return;
     dbg(`prompt error: ${errorText(err)}`);
+    // Failed while OpenCode runs a step (the stream is closed between a tool-call and its
+    // continuation): kept for the continuation, which would otherwise wait forever.
+    if (!t.controller) { if (!t.aborted) t.doneErr = err; return; }
     try {
       t.controller.enqueue({ type: "error", error: limitError(err) ?? err });
       t.controller.close();
     } catch { /* ignore */ }
     t.controller = null;
+  }
+
+  /** The prompt failed while no stream was attached: fail the current one with it. */
+  private failFromDone(t: TurnState) {
+    const err = t.doneErr;
+    t.doneErr = null;
+    this.flushPending(t);
+    this.onPromptError(t, err);
   }
 
   /** Fired by the MCP host when the agent calls an OpenCode tool. The call is NOT
@@ -1483,6 +1637,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     const t = this.byAcpSession.get(String(params?.sessionId ?? ""));
     if (!t) return;
     const update = params?.update;
+    if (TURN_UPDATES.has(update?.sessionUpdate)) t.genEvents++;
     // Mode switch (e.g. ExitPlanMode approved: plan → default). Track it even without a
     // live controller so the bridge stays in sync and won't re-force the agent's
     // configured mode on the next turn (which would undo the plan-exit).
@@ -1656,15 +1811,30 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     return ctrl;
   }
 
+  /** session/set_model, or — claude-agent-acp ≥ 0.99 dropped it ("Method not found") —
+   *  the `model` config option, which takes the same ids. Learned once per connection. */
+  private async setModel(sessionId: string, modelId: string): Promise<void> {
+    if (!this.modelByConfig) {
+      try {
+        await this.connection.unstable_setSessionModel({ sessionId, modelId });
+        return;
+      } catch (e: any) {
+        if (e?.code !== -32601) throw e;
+        this.modelByConfig = true;
+      }
+    }
+    await this.connection.setSessionConfigOption({ sessionId, configId: "model", value: modelId });
+  }
+
   /** Apply runtime config (mode/effort) to a live ACP session via set_mode/set_config_option. */
   private async applySessionConfig(t: TurnState, ctrl: ClaudeCodeControl): Promise<void> {
     if (ctrl.model && ctrl.model !== t.appliedModel) {
       try {
-        await this.connection.unstable_setSessionModel({ sessionId: t.sessionId, modelId: ctrl.model });
+        await this.setModel(t.sessionId, ctrl.model);
         t.appliedModel = ctrl.model;
         dbg(`model → ${ctrl.model}`);
       } catch (e) {
-        note(`warning: could not apply model ${ctrl.model} (${e instanceof Error ? e.message : String(e)})`);
+        note(`warning: could not apply model ${ctrl.model} (${errorText(e)})`);
       }
     }
     // A CHANGED request (the user reselected the plan agent) overrides a mode the agent
@@ -1746,6 +1916,9 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
         },
         async writeTextFile() { return {}; },
         async readTextFile() { return { content: "" }; },
+        // Agent notices (claude-agent-acp ≥ 0.99 sends `_auth/status_update`): not ours,
+        // but unhandled they print an SDK error over OpenCode's output.
+        async extNotification() {},
       }),
       stream,
     );

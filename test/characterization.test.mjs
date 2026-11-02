@@ -701,6 +701,103 @@ test("2c: a limit reported as an ACP error kind is recognised too", async () => 
   assert.ok(limitError(err));
 });
 
+/** Rejects if `p` hasn't settled within `ms` — a hung stream fails fast and says so. */
+const within = (p, ms, what) => Promise.race([p, sleep(ms).then(() => { throw new Error(`${what} hung`); })]);
+const errorOf = (parts) => parts.find((p) => p.type === "error")?.error;
+
+test("#26: a usage limit hit while OpenCode runs a step fails the continuation instead of hanging", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const hist = [SYS, user("arregla el build")];
+    const t1 = await first(agent, model, hist, { session: "ses_q26" });
+    const tool = agent.callTool(t1.sid, "bash", { command: "make" });
+    const [c] = callsOf(await t1.r.done);
+    // The limit lands while the stream is closed (OpenCode running the tool).
+    agent.failTurn(t1.sid, "Claude AI usage limit reached|1792700000");
+    await sleep(30);
+    const r2 = run(model, opts([...hist, asst(call(c.toolCallId, "bash", { command: "make" })), result(c.toolCallId, "bash", "ok")], { session: "ses_q26" }));
+    const parts = await within(r2.done, 2000, "continuation after the limit");
+    assert.match(String(errorOf(parts)?.message), /usage limit reached/);
+    await tool;
+  } finally { done(); }
+});
+
+test("#27: after a failed turn the next prompt goes to a new agent process, same session id", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q27" });
+    await agent.chunk(t1.sid, "Compacting...");
+    agent.failTurn(t1.sid, "Error during compaction");
+    assert.ok(errorOf(await within(t1.r.done, 2000, "failed turn")));
+    // After the reset / a retry: closed and resumed, so nothing of the failed turn is queued.
+    const r2 = run(model, opts([SYS, user("uno"), user("continúa")], { session: "ses_q27" }));
+    await agent.next("ext", (e) => e.method === "session/close" && e.params.sessionId === t1.sid);
+    await agent.next("resumeSession", (e) => e.sessionId === t1.sid);
+    const p2 = await agent.next("prompt", (e) => /continúa/.test(e.text));
+    assert.equal(p2.sessionId, t1.sid);
+    await reply(agent, t1.sid, r2, "sigo");
+    assert.equal(textOf(r2.parts), "sigo");
+    assert.equal(agent.log.some((e) => e.type === "prompt" && e.stale), false);
+    assert.equal(agent.log.some((e) => e.type === "forked"), false);
+  } finally { done(); }
+});
+
+test("#27: when the resume fails the session is forked instead (context kept)", async () => {
+  const { agent, model, done } = setup({ agent: { resumeFails: true } });
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q27f" });
+    agent.failTurn(t1.sid, "API Error: 499 Client Closed Request");
+    await within(t1.r.done, 2000, "failed turn");
+    const r2 = run(model, opts([SYS, user("uno"), user("otra vez")], { session: "ses_q27f" }));
+    const fk = await agent.next("forked", (e) => e.from === t1.sid);
+    const p2 = await agent.next("prompt", (e) => e.sessionId === fk.sessionId);
+    assert.match(p2.text, /otra vez/);
+    await reply(agent, fk.sessionId, r2, "ok");
+    assert.equal(textOf(r2.parts), "ok");
+  } finally { done(); }
+});
+
+test("#27: a prompt the agent ends without running (leftover idle) is re-sent to a new process, same stream", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q27b" });
+    await reply(agent, t1.sid, t1.r, "R1");
+    agent.leaveStaleIdle(t1.sid); // e.g. Claude Code compacted on its own between turns
+    const r2 = run(model, opts([SYS, user("uno"), asst("R1"), user("dos")], { session: "ses_q27b" }));
+    const stale = await agent.next("prompt", (e) => e.sessionId === t1.sid && /dos/.test(e.text));
+    assert.equal(stale.stale, true);
+    await agent.next("resumeSession", (e) => e.sessionId === t1.sid);
+    const p2 = await agent.next("prompt", (e) => e.sessionId === t1.sid && /dos/.test(e.text));
+    assert.notEqual(p2.stale, true);
+    await reply(agent, t1.sid, r2, "R2");
+    const parts = await within(r2.done, 2000, "recovered turn");
+    assert.equal(textOf(parts), "R2");
+    assert.equal(finishOf(parts).finishReason.unified, "stop");
+  } finally { done(); }
+});
+
+test("#27: Claude Code never compacts while idle (a turn no prompt would read)", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q27c" });
+    const ns = agent.log.find((e) => e.type === "newSession" && e.sessionId === t1.sid);
+    assert.equal(ns.meta.claudeCode.options.settings.idleCompaction, false);
+    await reply(agent, t1.sid, t1.r, "R1");
+  } finally { done(); }
+});
+
+test("#28: an agent without session/set_model (0.99) gets the model as a config option", async () => {
+  const { ACPModelView } = await import("./helpers.mjs");
+  const { agent, model: core, done } = setup({ agent: { noSetModel: true } });
+  try {
+    const t1 = await first(agent, new ACPModelView(core, "sonnet"), [SYS, user("uno")], { session: "ses_q28" });
+    const sc = await agent.next("setConfig", (e) => e.configId === "model");
+    assert.equal(sc.value, "sonnet");
+    assert.equal(sc.sessionId, t1.sid);
+    await reply(agent, t1.sid, t1.r, "R1");
+  } finally { done(); }
+});
+
 // ------------------------------------------------- RESOURCES ------------------
 
 test("#13: switching opus ↔ sonnet keeps the session (set_model), no second agent", async () => {

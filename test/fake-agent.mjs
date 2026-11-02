@@ -2,7 +2,7 @@
 // AgentSideConnection) and real MCP: it spawns the `mcpServers` entry the provider
 // passes in `session/new` (our mcp-runtime.js) and drives it over stdio, so the whole
 // deferred tools/call path is exercised. Tests script it turn by turn.
-import { AgentSideConnection, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import { AgentSideConnection, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
@@ -122,13 +122,26 @@ export function createFakeAgent(opts = {}) {
     },
     async setSessionMode(params) { emit({ type: "setMode", ...params }); return {}; },
     async setSessionConfigOption(params) { emit({ type: "setConfig", ...params }); return { configOptions: [] }; },
-    async unstable_setSessionModel(params) { emit({ type: "setModel", ...params }); return {}; },
+    async unstable_setSessionModel(params) {
+      // noSetModel: claude-agent-acp ≥ 0.99, where the model is only a config option.
+      if (opts.noSetModel) throw RequestError.methodNotFound("session/set_model");
+      emit({ type: "setModel", ...params });
+      return {};
+    },
     async authenticate() { return {}; },
     async prompt(params) {
       const s = sessions.get(params.sessionId);
       const text = params.prompt.map((b) => (b.type === "text" ? b.text : `<${b.type}>`)).join("\n");
-      return new Promise((resolve) => {
-        const turn = { resolve, blocks: params.prompt, text };
+      // staleIdle: claude-agent-acp 0.31 after a turn that failed — the failed turn's
+      // trailing `idle` is still queued, so this prompt returns at once, empty, with zero
+      // usage, while the real turn runs unread. Clears itself (once), like the real queue.
+      if (s.staleIdle) {
+        s.staleIdle = false;
+        emit({ type: "prompt", sessionId: params.sessionId, blocks: params.prompt, text, stale: true });
+        return { stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 } };
+      }
+      return new Promise((resolve, reject) => {
+        const turn = { resolve, reject, blocks: params.prompt, text };
         if (s.turn) {
           if (queueing) s.turn.resolve({ stopReason: "end_turn" });
           else turn.queuedBehind = s.turn;
@@ -199,6 +212,17 @@ export function createFakeAgent(opts = {}) {
     /** MCP `notifications/cancelled` for a tools/call, as Claude Code sends on interrupt. */
     cancelCall(sid, requestId) { sessions.get(sid).mcp.notify("notifications/cancelled", { requestId, reason: "interrupted" }); },
     requestPermission: (sid, toolCall, options) => conn.requestPermission({ sessionId: sid, toolCall, options }),
+    /** Fail the running prompt of `sid` as claude-agent-acp does on an error result (usage
+     *  limit, API error): the prompt rejects and, as in 0.31, the session keeps that turn's
+     *  trailing `idle` queued for the next prompt (`staleIdle`). */
+    failTurn(sid, message = "Internal error", data) {
+      const s = sessions.get(sid);
+      const t = s.turn; s.turn = null;
+      s.staleIdle = true;
+      t?.reject(new RequestError(-32603, message, data));
+    },
+    /** The next prompt of `sid` ends at once on a leftover `idle` (see `failTurn`). */
+    leaveStaleIdle(sid) { sessions.get(sid).staleIdle = true; },
     /** Finish the running prompt of `sid`. */
     endTurn(sid, resp = { stopReason: "end_turn" }) {
       const s = sessions.get(sid);

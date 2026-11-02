@@ -6,6 +6,33 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 > **OpenCode V2 only since 0.9.0.** Versions 0.9.0 and later load only in OpenCode V2. If you
 > are still on OpenCode V1, stay on 0.8.x. See [MIGRATION_V2.md](MIGRATION_V2.md).
 
+## [0.11.1] — 2026-11-02
+
+### Added
+
+- **claude-agent-acp 0.99 support.** That release dropped `session/set_model` and the
+  `models` list: models are discovered from, and applied through, the `model` config option
+  (the method is still used on agents that have it). Its `_auth/status_update` notices are
+  ignored instead of printing an SDK error. On 0.99 discovery lists more models (aliases plus
+  full ids) and no `dontAsk` mode, so there is no `claude-dontask` agent.
+
+### Fixed
+
+- **A turn no longer hangs after the usage limit.** A prompt that failed while OpenCode was
+  running a tool (the limit hit mid tool loop, or by a background subagent) was dropped, and
+  OpenCode stayed "working" forever. The error is now delivered to the next stream of the
+  turn, so OpenCode shows the limit message and the turn ends.
+- **Turns after a failed one (limit, API/gateway error, failed compaction) run again.**
+  claude-agent-acp 0.31 leaves the failed turn's `idle` queued, so the next prompt returned at
+  once, empty, while Claude worked on it unread (its tool calls never reached OpenCode). After
+  any prompt error the session is now re-opened in a new agent process before the next
+  prompt: closed and resumed under the same id (context and prompt cache kept), or forked
+  when the resume fails.
+- **A prompt the agent ends without running it** (`end_turn`, nothing streamed, zero usage)
+  is re-sent once on a re-opened session, on the same stream, instead of finishing empty.
+- **Claude Code no longer compacts while idle** (`idleCompaction: false`): that compaction
+  runs as a turn no prompt reads, and desynchronised the next one the same way.
+
 ## [0.11.0] — 2026-10-26
 
 ### Changed — breaking

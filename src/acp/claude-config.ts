@@ -247,7 +247,8 @@ const DEFAULT_SUBAGENT = {
 /** Build `_meta.claudeCode.options`: "clean brain" by default, plus any reactivated
  *  native features (skills/subagents/resource-search/memory/tools) composed in. A
  *  raw override (ctrl.tools / ctrl.settingSources) still wins; with every toggle off
- *  the result is the unchanged clean brain (`{tools:[], settingSources:[]}`). */
+ *  the result is the unchanged clean brain (`{tools:[], settingSources:[]}`, idle
+ *  compaction off). */
 export function buildClaudeCodeOptions(ctrl: ClaudeCodeControl): Record<string, unknown> {
   const toolSet = new Set<string>(ctrl.nativeTools ?? []);
   const sourceSet = new Set<"user" | "project" | "local">();
@@ -274,6 +275,9 @@ export function buildClaudeCodeOptions(ctrl: ClaudeCodeControl): Record<string, 
     }
   }
   if (ctrl.projectMemory) sourceSet.add("project");
+  // No compaction while idle: Claude Code runs it as a turn of its own that no prompt
+  // reads, and claude-agent-acp then ends the NEXT prompt on that turn's `idle`.
+  settings = { ...(settings ?? {}), idleCompaction: false };
 
   const o: Record<string, unknown> = {
     tools: ctrl.tools ?? [...toolSet],
