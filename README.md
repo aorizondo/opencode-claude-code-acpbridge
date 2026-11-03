@@ -647,6 +647,8 @@ per turn decision.
 | Claude doesn't ask you, it assumes | It asks through OpenCode's `question` tool, so the agent must be allowed to use it (the injected agents are). |
 | Claude doesn't search the web | The injected agents include the **native** `WebSearch`, in case OpenCode's `websearch` isn't available. |
 | Slow with many tools | With hundreds of tools each step can take ~1 min. Reduce the tools exposed with the agent's `permissions` ruleset. |
+| Your version isn't the one running / log says `configured more than once with different specs` | Another config (typically a remote/organization one) declares the plugin with another spec. OpenCode keeps the first layer that loads it (remote before yours) and drops the other as `Duplicate plugin ID`. Use the **same** spec in every config: then one copy runs, with your options. |
+| A turn stops with `Step interrupted` after a long silence | OpenCode V2 stops running sessions after 60 min with no recorded event in their directory (streamed text doesn't count); a suspended laptop hits it on wake. Send the message again: the Claude Code session is kept. |
 
 Maintenance command:
 

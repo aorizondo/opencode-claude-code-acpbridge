@@ -6,6 +6,29 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 > **OpenCode V2 only since 0.9.0.** Versions 0.9.0 and later load only in OpenCode V2. If you
 > are still on OpenCode V1, stay on 0.8.x. See [MIGRATION_V2.md](MIGRATION_V2.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **"continue" after a stopped turn no longer fails.** When a turn was stopped mid tool loop,
+  claude-agent-acp 0.31 failed the next prompt at once with the CLI's diagnostic for the
+  interrupted cycle (`[ede_diagnostic] result_type=user last_content_type=n/a
+  stop_reason=tool_use`); OpenCode retried into the same error and the session looked dead.
+  The prompt is now re-sent once on a re-opened session, on the same stream.
+
+### Added
+
+- **Warning when OpenCode drops a second copy of the plugin.** Configured with different
+  specs in two configs (e.g. a remote/organization config pinning another version), OpenCode
+  runs the first layer's copy and silently ignores the other. The running copy now logs
+  which spec runs and which was ignored.
+
+### Changed
+
+- Dependencies updated within their current majors (`@mcpc-tech/acp-ai-provider` 0.3.9;
+  dev: `@opencode/plugin` 2.2.5, TypeScript 5.9). `ai` and `@ai-sdk/provider` stay on 6 / 3,
+  the majors OpenCode V2 serves to plugins.
+
 ## [0.11.1] — 2026-11-02
 
 ### Added
