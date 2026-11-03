@@ -46,3 +46,29 @@ export function compatibilityWarnings(input: { opencode?: string; agent?: string
   }
   return warnings;
 }
+
+/** A plugin as OpenCode's `plugin.list` reports it (only the fields read here). */
+export type ListedPlugin = {
+  readonly id: string;
+  readonly source?: { readonly type?: string; readonly target?: string; readonly version?: string };
+  readonly state?: { readonly status?: string; readonly error?: string };
+};
+
+/** The bridge configured twice with different specs (e.g. a remote/organization config
+ *  pins one version and the user's own config another). OpenCode V2 keys packages by the
+ *  full spec but plugins by id: the first layer to load wins (remote configs load before
+ *  the user's) and the other is dropped as "Duplicate plugin ID" — silently, so the user
+ *  runs a version they did not choose. Same spec in both layers is fine: one instance,
+ *  with the later layer's options. */
+export function duplicateWarning(plugins: readonly ListedPlugin[], id: string): string | undefined {
+  const ours = plugins.filter((p) => p.id === id && p.source?.type === "package");
+  const active = ours.find((p) => p.state?.status === "active");
+  const dropped = ours.filter((p) => p.state?.status === "failed" && /duplicate plugin id/i.test(p.state.error ?? ""));
+  if (!active || !dropped.length) return undefined;
+  const spec = (p: ListedPlugin) => p.source?.target ?? p.id;
+  return (
+    `${id} is configured more than once with different specs: ${spec(active)} is running and ` +
+    `${dropped.map(spec).join(", ")} was ignored (OpenCode keeps the first config layer that loads it; ` +
+    `a remote/organization config loads before yours). Use the same spec in every config to pick the version.`
+  );
+}

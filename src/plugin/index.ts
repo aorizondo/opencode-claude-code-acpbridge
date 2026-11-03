@@ -10,7 +10,7 @@ import { FALLBACK_MODES, modeAgentDefs, pairTarget, subagentDecision, isProvider
 import { detectClaudeExecutable } from "../provider/factory.js";
 
 import { logger } from "../log.js";
-import { compatibilityWarnings } from "./compat.js";
+import { compatibilityWarnings, duplicateWarning } from "./compat.js";
 
 const log = logger("acp-plugin");
 const dbg = log.dbg;
@@ -157,8 +157,13 @@ export function titleFrom(messages: readonly any[]): string | undefined {
   return `${cut.slice(0, cut.lastIndexOf(" ") > 30 ? cut.lastIndexOf(" ") : 60)}…`;
 }
 
+const PLUGIN_ID = "opencode-claude-code-acpbridge";
+/** OpenCode resolves the whole plugin list after setups start: look for a dropped
+ *  duplicate of this plugin once it has settled. */
+const DUPLICATE_CHECK_MS = 15_000;
+
 export const ACPPlugin = Plugin.define({
-  id: "opencode-claude-code-acpbridge",
+  id: PLUGIN_ID,
   async setup(ctx) {
     const opts = (ctx.options ?? {}) as Record<string, any>;
     const providerId: string = opts.providerId ?? "acp";
@@ -414,6 +419,20 @@ export const ACPPlugin = Plugin.define({
       }
     })();
 
+    // Configured twice with different specs (a remote config pinning another version):
+    // OpenCode drops one silently. Only the instance that runs can say so.
+    const duplicateCheck = setTimeout(async () => {
+      try {
+        const listed = await ctx.plugin.list();
+        const plugins = (Array.isArray(listed) ? listed : (listed as any)?.data ?? []) as any[];
+        const warning = duplicateWarning(plugins, PLUGIN_ID);
+        if (warning) log.note(warning);
+      } catch (e) {
+        dbg(`duplicate check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }, DUPLICATE_CHECK_MS);
+    duplicateCheck.unref?.();
+
     // OpenCode subagents never run on this provider: a child would inherit its Claude
     // Code parent's model, so it gets its own configured model or the default one.
     const subagent = await ctx.tool.hook("execute.before", async (event) => {
@@ -436,6 +455,7 @@ export const ACPPlugin = Plugin.define({
 
     return async () => {
       closed.abort();
+      clearTimeout(duplicateCheck);
       for (const timer of pending.values()) clearTimeout(timer);
       pending.clear();
       await subagent.dispose();
