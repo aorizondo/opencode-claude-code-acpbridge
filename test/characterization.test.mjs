@@ -776,6 +776,55 @@ test("#27: a prompt the agent ends without running (leftover idle) is re-sent to
   } finally { done(); }
 });
 
+test("#29: the interrupted cycle's [ede_diagnostic] error is not the next prompt's outcome — re-sent, same stream", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q29" });
+    await reply(agent, t1.sid, t1.r, "R1");
+    // e.g. the user stopped a turn mid tool loop; claude-agent-acp 0.31 hands the CLI's
+    // diagnostic for that cycle to the next prompt as an internal error.
+    agent.leaveStaleInterrupt(t1.sid);
+    const r2 = run(model, opts([SYS, user("uno"), asst("R1"), user("continua")], { session: "ses_q29" }));
+    const stale = await agent.next("prompt", (e) => e.sessionId === t1.sid && /continua/.test(e.text));
+    assert.equal(stale.stale, true);
+    await agent.next("resumeSession", (e) => e.sessionId === t1.sid);
+    const p2 = await agent.next("prompt", (e) => e.sessionId === t1.sid && /continua/.test(e.text));
+    assert.notEqual(p2.stale, true);
+    await reply(agent, t1.sid, r2, "R2");
+    const parts = await within(r2.done, 2000, "recovered turn");
+    assert.equal(errorOf(parts), undefined);
+    assert.equal(textOf(parts), "R2");
+  } finally { done(); }
+});
+
+test("#29: an [ede_diagnostic] error on the re-sent prompt reaches OpenCode (no loop)", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q29b" });
+    await reply(agent, t1.sid, t1.r, "R1");
+    agent.leaveStaleInterrupt(t1.sid);
+    const r2 = run(model, opts([SYS, user("uno"), asst("R1"), user("continua")], { session: "ses_q29b" }));
+    await agent.next("resumeSession", (e) => e.sessionId === t1.sid);
+    agent.leaveStaleInterrupt(t1.sid);
+    const parts = await within(r2.done, 2000, "second diagnostic");
+    assert.match(String(errorOf(parts)?.message), /ede_diagnostic/);
+    assert.equal(agent.log.filter((e) => e.type === "prompt" && /continua/.test(e.text)).length, 2);
+  } finally { done(); }
+});
+
+test("#29: an error that is not the interrupted-cycle diagnostic is reported as is", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_q29c" });
+    await reply(agent, t1.sid, t1.r, "R1");
+    agent.leaveStaleInterrupt(t1.sid, "[ede_diagnostic] result_type=assistant last_content_type=text stop_reason=end_turn");
+    const r2 = run(model, opts([SYS, user("uno"), asst("R1"), user("dos")], { session: "ses_q29c" }));
+    const parts = await within(r2.done, 2000, "plain error");
+    assert.match(String(errorOf(parts)?.message), /result_type=assistant/);
+    assert.equal(agent.log.filter((e) => e.type === "prompt" && /dos/.test(e.text)).length, 1);
+  } finally { done(); }
+});
+
 test("#27: Claude Code never compacts while idle (a turn no prompt would read)", async () => {
   const { agent, model, done } = setup();
   try {

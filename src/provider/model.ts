@@ -365,6 +365,15 @@ function errorText(err: unknown): string {
   return [e.message, e.data !== undefined ? JSON.stringify(e.data) : ""].filter(Boolean).join(" ");
 }
 
+/** The CLI's diagnostic for a cycle interrupted before Claude answered (the turn was
+ *  stopped mid tool loop): `[ede_diagnostic] result_type=user last_content_type=n/a`.
+ *  claude-agent-acp 0.31 fails the NEXT prompt with it, so it describes an earlier turn,
+ *  not the prompt that receives it. (0.99 swallows only its `stop_reason=null` form.) */
+export function isInterruptedCycle(err: unknown): boolean {
+  const raw = errorText(err);
+  return /\[ede_diagnostic\]/.test(raw) && /\bresult_type=user\b/.test(raw) && /\blast_content_type=n\/a\b/.test(raw);
+}
+
 /** Claude's usage/rate limit, rewritten so the user knows to switch models — and in
  *  words OpenCode's retry classifier doesn't match ("try again", "overloaded"…), so it
  *  isn't retried in a loop against an exhausted subscription. */
@@ -1220,8 +1229,9 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           this.onPromptDone(t, resp);
         },
         (err: any) => {
-          if (gen === t.gen) this.onPromptError(t, err);
-          else dbg(`stale prompt error ignored (gen ${gen} < ${t.gen})`);
+          if (gen !== t.gen) { dbg(`stale prompt error ignored (gen ${gen} < ${t.gen})`); return; }
+          if (retry && t.genEvents === 0 && isInterruptedCycle(err)) return this.recoverStale(t, blocks);
+          this.onPromptError(t, err);
         },
       )
       .then(() => { if (t.inflight === settled) t.inflight = null; });
@@ -1237,9 +1247,9 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     return !(u.inputTokens || u.outputTokens || u.cachedReadTokens || u.cachedWriteTokens);
   }
 
-  /** The prompt "finished" without running and its real turn now runs unread. Stop it,
-   *  re-open the session and send the prompt again on the SAME stream, so OpenCode only
-   *  sees a slower answer instead of an empty one. Once per prompt. */
+  /** The prompt "finished" (or failed) without running and its real turn now runs unread.
+   *  Stop it, re-open the session and send the prompt again on the SAME stream, so OpenCode
+   *  only sees a slower answer instead of an empty one or an error. Once per prompt. */
   private async recoverStale(t: TurnState, blocks: any[]) {
     note(`session ${t.sessionId}: the agent ended a turn it never ran (leftover of an earlier turn) — re-opening the session`);
     // Stop the unread run (agent-side cancel, its calls released) but keep the stream.

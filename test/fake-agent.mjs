@@ -140,6 +140,15 @@ export function createFakeAgent(opts = {}) {
         emit({ type: "prompt", sessionId: params.sessionId, blocks: params.prompt, text, stale: true });
         return { stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 } };
       }
+      // staleInterrupt: claude-agent-acp 0.31 after a turn cancelled mid tool loop — the
+      // CLI ends the interrupted cycle with an `[ede_diagnostic]` error result that the
+      // next prompt reads as its own outcome. Clears itself (once).
+      if (s.staleInterrupt) {
+        const message = s.staleInterrupt;
+        s.staleInterrupt = null;
+        emit({ type: "prompt", sessionId: params.sessionId, blocks: params.prompt, text, stale: true });
+        throw new RequestError(-32603, `Internal error: ${message}`);
+      }
       return new Promise((resolve, reject) => {
         const turn = { resolve, reject, blocks: params.prompt, text };
         if (s.turn) {
@@ -223,6 +232,10 @@ export function createFakeAgent(opts = {}) {
     },
     /** The next prompt of `sid` ends at once on a leftover `idle` (see `failTurn`). */
     leaveStaleIdle(sid) { sessions.get(sid).staleIdle = true; },
+    /** The next prompt of `sid` fails at once with the interrupted cycle's diagnostic. */
+    leaveStaleInterrupt(sid, message = "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use") {
+      sessions.get(sid).staleInterrupt = message;
+    },
     /** Finish the running prompt of `sid`. */
     endTurn(sid, resp = { stopReason: "end_turn" }) {
       const s = sessions.get(sid);
