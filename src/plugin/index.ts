@@ -305,8 +305,27 @@ export const ACPPlugin = Plugin.define({
     // The same per-call options go with the auxiliary calls too: without them a
     // compaction request reached the provider anonymous and was served by a cold,
     // throwaway session replaying the whole history.
-    const inject = (kind: "primary" | "compaction" | "generate") => (event: any) => {
+    // Directory of each OpenCode session: Claude Code works there. Fixed for a session,
+    // and looked up once (the hook fires on every step).
+    const directories = new Map<string, string | undefined>();
+    const directoryOf = async (sessionID: string): Promise<string | undefined> => {
+      if (directories.has(sessionID)) return directories.get(sessionID);
+      let dir: string | undefined;
+      try {
+        const session: any = await ctx.session.get({ sessionID: sessionID as any });
+        const root = session?.location?.directory ? String(session.location.directory) : undefined;
+        dir = root && session?.subpath ? join(root, String(session.subpath)) : root;
+      } catch (e) {
+        dbg(`session ${sessionID}: directory unknown (${e instanceof Error ? e.message : String(e)})`);
+      }
+      if (directories.size > 500) directories.delete(directories.keys().next().value!);
+      directories.set(sessionID, dir);
+      return dir;
+    };
+    const inject = (kind: "primary" | "compaction" | "generate") => async (event: any) => {
         if (event.model.providerID !== providerId) return;
+        const directory = await directoryOf(String(event.sessionID));
+        if (directory) event.options.ocDirectory = directory;
         event.options.ocSession = event.sessionID;
         event.options.ocAgent = String(event.agent);
         event.options.requestKind = kind;
@@ -323,6 +342,7 @@ export const ACPPlugin = Plugin.define({
           if (link.lastUsage) event.options.resumeLastUsage = link.lastUsage;
           if (link.convKey) event.options.resumeConvKey = link.convKey;
           if (link.idPrefixes?.length) event.options.resumeIdPrefixes = link.idPrefixes;
+          if (link.cwd) event.options.resumeCwd = link.cwd;
         }
         const extra = agentOptions.get(String(event.agent));
         if (extra) for (const [k, v] of Object.entries(extra)) event.options[k] = v;

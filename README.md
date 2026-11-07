@@ -243,7 +243,7 @@ the provider.
 | --- | --- | --- | --- | --- |
 | `command` | `string` | `ACP_COMMAND` | — | ACP agent command, e.g. `"claude-agent-acp"`. **Without it the plugin doesn't register anything** (manual setup, see below). |
 | `args` | `string[]` | `ACP_ARGS` (JSON array or space-separated) | — | Arguments for `command`. |
-| `cwd` | `string` | `ACP_CWD` | server's working directory | Working directory of the agent process. |
+| `cwd` | `string` | `ACP_CWD` | each session's OpenCode directory | Working directory of every Claude Code session. Unset, each session works in the directory of its OpenCode session; set, all of them use this one. |
 | `env` | `Record<string,string>` | — | — | Extra environment variables for the agent process. |
 | `claudeExecutable` | `string` | `CLAUDE_CODE_EXECUTABLE` | `command -v claude` | Path to the `claude` binary. |
 | `streamCloseTimeoutMs` | `number` | `ACP_STREAM_CLOSE_TIMEOUT_MS` | `600000` | Sets `CLAUDE_CODE_STREAM_CLOSE_TIMEOUT` for older agents. `claude-agent-acp` ≥ 0.31 doesn't read it: a pending tool call is bounded by `MCP_TOOL_TIMEOUT` (~27 h by default), so waiting for you to approve a permission never cuts the turn. |
@@ -608,7 +608,9 @@ it in a terminal:
 claude --resume 1c66e017-4536-4157-80aa-e451420520e0
 ```
 
-Run it **in the same working directory**: Claude Code indexes sessions by `cwd`. For the old
+Run it **in the same working directory**: Claude Code indexes sessions by `cwd`, which is the
+OpenCode session's directory (sessions created before 0.11.3 stay in the directory they were
+created in, usually the server's). For the old
 isolation, set `"configDir": "isolated"`: sessions then live outside your `~/.claude` and are
 invisible to `--resume`.
 

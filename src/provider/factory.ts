@@ -84,7 +84,8 @@ export interface ACPModelProviderOptions {
   command?: string;
   /** Arguments array. */
   args?: string[];
-  /** Working directory for the ACP agent. */
+  /** Working directory for EVERY Claude Code session. Default: each session's own
+   *  OpenCode directory. */
   cwd?: string;
   /** Extra environment variables for the agent process. */
   env?: Record<string, string>;
@@ -138,7 +139,9 @@ function resolveOrchestratorConfig(opts: ACPModelProviderOptions): Omit<ACPModel
   return {
     command,
     args: args && args.length > 0 ? args : undefined,
-    cwd: opts.cwd ?? process.env.ACP_CWD ?? process.cwd(),
+    // Unset by default: each Claude Code session then works in its OpenCode session's
+    // directory. Setting it pins every session to one directory.
+    cwd: opts.cwd ?? process.env.ACP_CWD,
     env: opts.env,
     claudeCode: opts.claudeCode ?? {},
     claudeExecutable,

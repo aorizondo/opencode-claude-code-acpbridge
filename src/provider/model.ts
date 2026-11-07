@@ -150,6 +150,10 @@ interface TurnState {
   /** Prefix of every toolCallId minted by `host` — identifies OUR OWN calls. */
   idPrefix: string;
   sessionId: string;
+  /** Directory Claude Code works in: the OpenCode session's, or — for a session resumed
+   *  from the registry — the one it was created in. Fixed for the session's lifetime
+   *  (forks and re-opens find its transcript there). */
+  cwd: string;
   convKey: string;
   toolsKey: string;
   systemKey: string;
@@ -542,7 +546,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
         // Without queueing it rides on the last tool result instead.
         // Keep the registry in step mid-turn too: a restart now resumes right here
         // instead of replaying every tool round-trip since the user's message.
-        if (t.ocSession) setLink(t.ocSession, t.sessionId, t.sentKeys.length, t.convKey, t.ownPrefixes);
+        if (t.ocSession) setLink(t.ocSession, t.sessionId, t.sentKeys.length, t.convKey, t.ownPrefixes, t.cwd);
         const extraBlocks = continuation.extras.length ? this.midTurnBlocks(t, continuation.extras) : [];
         const results = continuation.results;
         const lastTool = results.map((r) => !t.pendingPermissions.has(r.toolCallId)).lastIndexOf(true);
@@ -746,7 +750,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           });
           if (ctrl.smartRevert !== false) this.recordCheckpoint(live, hist, cls.fromIndex);
           this.markKnown(live, hist);
-          if (ocSession) setLink(ocSession, live.sessionId, hist.length, convKey, live.ownPrefixes);
+          if (ocSession) setLink(ocSession, live.sessionId, hist.length, convKey, live.ownPrefixes, live.cwd);
           this.sendPrompt(live, blocks.length ? blocks : [{ type: "text", text: "" }]);
           return;
         }
@@ -788,11 +792,16 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     // or a reused id) must not be resumed — the agent would carry the wrong context.
     const sameConv = !po.resumeConvKey || po.resumeConvKey === convKey;
     if (!sameConv) dbg(`resumeConvKey mismatch (registry=${po.resumeConvKey} current=${convKey}) — not resuming`);
+    // Claude Code works in the OpenCode session's directory. A registered session is
+    // resumed where it was created: its transcript lives under that directory's slug, and
+    // entries from before the registry kept one were all created in the default.
+    let cwd = this.sessionCwd(po);
     if (resumeId && sameConv && resumeLen > 0 && hist.length > resumeLen) {
+      const resumeCwd = typeof po.resumeCwd === "string" && po.resumeCwd ? po.resumeCwd : this.defaultCwd();
       try {
         const resumed = await this.connection.unstable_resumeSession({
           sessionId: resumeId,
-          cwd: this.config.cwd ?? process.cwd(),
+          cwd: resumeCwd,
           mcpServers: [serverConfig],
           // Re-apply the clean-brain options on resume too. Without this the agent
           // falls back to its defaults (--tools default, --setting-sources=user,
@@ -802,6 +811,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
         } as any);
         sessionId = resumeId;
         replayFull = false;
+        cwd = resumeCwd;
         defaultEffort = effortOption(resumed);
         dbg(`resume ${resumeId} (oc=${ocSession ?? "?"}) — no history replay`);
       } catch (e) {
@@ -814,7 +824,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       const sysMeta = this.buildSystemPromptMeta(options.prompt, systemMode);
       if (sysMeta !== undefined) meta.systemPrompt = sysMeta;
       const session = await this.connection.newSession({
-        cwd: this.config.cwd ?? process.cwd(),
+        cwd,
         mcpServers: [serverConfig],
         _meta: meta,
       });
@@ -833,6 +843,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       host,
       idPrefix,
       sessionId,
+      cwd,
       convKey,
       toolsKey,
       systemKey,
@@ -888,7 +899,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     this.evictIdleSessions();
     this.startSweeper();
     await this.applySessionConfig(t, ctrl);
-    if (ocSession) setLink(ocSession, sessionId, hist.length, convKey, t.ownPrefixes);
+    if (ocSession) setLink(ocSession, sessionId, hist.length, convKey, t.ownPrefixes, t.cwd);
     // Resume: the registry may lag behind (process died mid-turn), and the agent's own
     // last answer follows the recorded point — the resumed session already has it.
     const tail = replayFull ? hist : this.dropOwnLead(t, hist.slice(resumeLen));
@@ -927,7 +938,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       if (sysMeta !== undefined) meta.systemPrompt = sysMeta;
       const res = await this.connection.unstable_forkSession({
         sessionId: t.sessionId,
-        cwd: this.config.cwd ?? process.cwd(),
+        cwd: t.cwd, // the source transcript is found under its own directory's slug
         mcpServers: [host.getServerConfig()],
         _meta: meta,
       });
@@ -999,7 +1010,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       if (sysMeta !== undefined) meta.systemPrompt = sysMeta;
       const res = await this.connection.unstable_resumeSession({
         sessionId: t.sessionId,
-        cwd: this.config.cwd ?? process.cwd(),
+        cwd: t.cwd,
         mcpServers: [host.getServerConfig()],
         _meta: meta,
       });
@@ -1040,7 +1051,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
   private lastAssistantUuid(t: TurnState): string | undefined {
     try {
       const dir = resolveConfigDir(this.config.claudeCode ?? {}) ?? join(homedir(), ".claude");
-      const slug = (this.config.cwd ?? process.cwd()).replace(/[^a-zA-Z0-9]/g, "-");
+      const slug = t.cwd.replace(/[^a-zA-Z0-9]/g, "-");
       const file = join(dir, "projects", slug, `${t.sessionId}.jsonl`);
       const fd = openSync(file, "r");
       try {
@@ -1788,7 +1799,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     if (own && typeof own === "object") return own as Record<string, any>;
     const SHAPE_KEYS = new Set([
       "ocSession", "ocAgent", "resumeId", "resumeLen", "resumeConvKey", "resumeLastUsage", "resumeIdPrefixes",
-      "requestKind", "hasQuestion",
+      "requestKind", "hasQuestion", "ocDirectory", "resumeCwd",
       "mode", "effort", "thinking", "systemPromptMode", "forwardEnvContext",
       "tools", "allowedTools", "disallowedTools", "settingSources", "strictMcpConfig",
       "nativeTools", "resourceSearch", "nativeSubagents", "nativeSkills", "projectMemory", "skillShell",
@@ -1799,6 +1810,18 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       if (Object.keys(value).some((k) => SHAPE_KEYS.has(k) || k.startsWith("native"))) return value as Record<string, any>;
     }
     return {};
+  }
+
+  /** Directory used when the call names none: `cwd` / `ACP_CWD`, else the server's own. */
+  private defaultCwd(): string {
+    return this.config.cwd ?? process.cwd();
+  }
+
+  /** Directory of the OpenCode session (`ocDirectory`, injected by the plugin). An
+   *  explicit provider `cwd` / `ACP_CWD` still wins, as before. */
+  private sessionCwd(po: Record<string, any>): string {
+    if (this.config.cwd) return this.config.cwd;
+    return typeof po.ocDirectory === "string" && po.ocDirectory ? po.ocDirectory : process.cwd();
   }
 
   /** Provider config overlaid with per-call `providerOptions.acp` (per-agent mode/effort/…). */

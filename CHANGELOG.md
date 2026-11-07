@@ -6,6 +6,20 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 > **OpenCode V2 only since 0.9.0.** Versions 0.9.0 and later load only in OpenCode V2. If you
 > are still on OpenCode V1, stay on 0.8.x. See [MIGRATION_V2.md](MIGRATION_V2.md).
 
+## [0.11.3] — 2026-11-06
+
+### Fixed
+
+- **Claude Code works in the OpenCode session's directory.** Every session used the
+  OpenCode server's working directory (`/home/<user>` for a server run as a service), so
+  Claude believed it was there: relative paths, native subagents and skills, project
+  `CLAUDE.md`/settings and `claude --resume` all pointed at the wrong place (OpenCode's own
+  tools were unaffected). The plugin now passes each session's directory, and the provider
+  creates the Claude Code session there. The registry records it, so a session is always
+  resumed, forked and re-opened where its transcript is; entries from earlier versions keep
+  the server's directory and their context. An explicit `cwd` / `ACP_CWD` still pins every
+  session to one directory.
+
 ## [0.11.2] — 2026-11-03
 
 ### Fixed

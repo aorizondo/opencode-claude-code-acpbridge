@@ -847,6 +847,64 @@ test("#28: an agent without session/set_model (0.99) gets the model as a config 
   } finally { done(); }
 });
 
+test("#29: each Claude Code session works in its OpenCode session's directory", async () => {
+  const { ACPOrchestratorModel } = await import("../dist/provider/model.js");
+  const { createFakeAgent } = await import("./helpers.mjs");
+  const agent = createFakeAgent();
+  // No provider `cwd`: the session's own directory decides.
+  const model = new ACPOrchestratorModel({ command: "fake", claudeCode: {}, transport: agent.transport });
+  try {
+    const a = run(model, opts([SYS, user("uno")], { session: "ses_d29a", extra: { ocDirectory: "/proj/a" } }));
+    const na = await agent.next("newSession");
+    assert.equal(na.params.cwd, "/proj/a");
+    await agent.next("prompt", (e) => e.sessionId === na.sessionId);
+    await reply(agent, na.sessionId, a, "R1");
+    const b = run(model, opts([SYS, user("otro")], { session: "ses_d29b", extra: { ocDirectory: "/proj/b" } }));
+    const nb = await agent.next("newSession");
+    assert.equal(nb.params.cwd, "/proj/b");
+    await agent.next("prompt", (e) => e.sessionId === nb.sessionId);
+    await reply(agent, nb.sessionId, b, "R2");
+  } finally { model.cleanup(); agent.close(); }
+});
+
+test("#29: a registered session resumes where it was created; an old entry, in the default directory", async () => {
+  const { ACPOrchestratorModel } = await import("../dist/provider/model.js");
+  const { createFakeAgent } = await import("./helpers.mjs");
+  const agent = createFakeAgent();
+  const model = new ACPOrchestratorModel({ command: "fake", claudeCode: {}, transport: agent.transport });
+  const hist = [SYS, user("uno"), asst("R1"), user("dos")];
+  try {
+    const r1 = run(model, opts(hist, { session: "ses_d29c", extra: { ocDirectory: "/proj/new", resumeId: "old-1", resumeLen: 2, resumeCwd: "/proj/old" } }));
+    const rs1 = await agent.next("resumeSession");
+    assert.equal(rs1.params.cwd, "/proj/old");
+    await agent.next("prompt", (e) => e.sessionId === "old-1");
+    await reply(agent, "old-1", r1, "R2");
+    // An entry written before the registry kept a directory: the server's own.
+    const r2 = run(model, opts(hist, { session: "ses_d29d", extra: { ocDirectory: "/proj/new", resumeId: "old-2", resumeLen: 2 } }));
+    const rs2 = await agent.next("resumeSession");
+    assert.equal(rs2.params.cwd, process.cwd());
+    await agent.next("prompt", (e) => e.sessionId === "old-2");
+    await reply(agent, "old-2", r2, "R2");
+    // Forks and re-opens stay in the session's directory too.
+    model.sessions.get("ses_d29c").resync = true;
+    const r3 = run(model, opts([...hist, asst("R2"), user("tres")], { session: "ses_d29c", extra: { ocDirectory: "/proj/new" } }));
+    const rs3 = await agent.next("resumeSession", (e) => e.sessionId === "old-1");
+    assert.equal(rs3.params.cwd, "/proj/old");
+    await agent.next("prompt", (e) => /tres/.test(e.text));
+    await reply(agent, "old-1", r3, "R3");
+  } finally { model.cleanup(); agent.close(); }
+});
+
+test("#29: an explicit provider cwd still pins every session", async () => {
+  const { agent, model, done } = setup();
+  try {
+    const t1 = await first(agent, model, [SYS, user("uno")], { session: "ses_d29e", extra: { ocDirectory: "/proj/a" } });
+    const ns = agent.log.find((e) => e.type === "newSession" && e.sessionId === t1.sid);
+    assert.equal(ns.params.cwd, process.cwd());
+    await reply(agent, t1.sid, t1.r, "R1");
+  } finally { done(); }
+});
+
 // ------------------------------------------------- RESOURCES ------------------
 
 test("#13: switching opus ↔ sonnet keeps the session (set_model), no second agent", async () => {

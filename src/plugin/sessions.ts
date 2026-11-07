@@ -40,6 +40,10 @@ export interface SessionLink {
    *  they mark which tool-calls in the history are the agent's own — already in its
    *  session, so never replayed. Optional for backward compatibility. */
   idPrefixes?: string[];
+  /** Directory the Claude Code session was created in: its transcript lives under that
+   *  directory's slug, so it is resumed there. Absent in entries written before 0.11.3,
+   *  all created in the provider's default directory. */
+  cwd?: string;
 }
 
 /** Entries older than this are dropped on write (sessions nobody resumed in a month;
@@ -100,6 +104,7 @@ export function setLink(
   sentHistoryLen: number,
   convKey?: string,
   idPrefixes?: string[],
+  cwd?: string,
 ): void {
   try {
     mkdirSync(DIR, { recursive: true });
@@ -114,6 +119,7 @@ export function setLink(
       ...(prev?.lastUsage ? { lastUsage: prev.lastUsage } : {}),
       ...(convKey ? { convKey } : {}),
       ...(idPrefixes?.length ? { idPrefixes: idPrefixes.slice(-8) } : {}),
+      ...(cwd ? { cwd } : {}),
     };
     atomicWriteJson(all);
   } catch {
