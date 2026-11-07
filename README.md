@@ -13,7 +13,7 @@ subscription. Claude Code becomes one more model in OpenCode; Claude does the th
 >   [Upgrading from 0.8.x](#upgrading-from-08x-opencode-v1)).
 > - **Tested with:**
 >   - OpenCode 2.1.1;
->   - `@agentclientprotocol/claude-agent-acp` 0.31.x and 0.99.x;
+>   - `@agentclientprotocol/claude-agent-acp` 0.31.x, 0.99.x and 0.101.x;
 >   - Claude Code CLI 2.1.308.
 >
 > Check your version with `opencode --version`.
