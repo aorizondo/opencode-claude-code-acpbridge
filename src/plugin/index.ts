@@ -1,6 +1,7 @@
 import { Agent, Model, Plugin, Provider } from "@opencode/plugin";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
 import { discoverAgent, type DiscoveredAgent } from "./discover.js";
 import { loadAnthropicCatalog, buildModelsInfo } from "./catalog.js";
 import { readCacheKeyed, writeCache } from "./cache.js";
@@ -56,10 +57,25 @@ function deepMerge(base: any, override: any): any {
 function resolveNpmSpec(override?: string): string {
   if (override) return override;
   const here = fileURLToPath(import.meta.url); // <root>/dist/plugin/index.js
-  if (here.includes("/node_modules/opencode-claude-code-acpbridge/")) return "opencode-claude-code-acpbridge";
+  // Pinned to THIS package's version: OpenCode installs an unversioned spec once, into
+  // `<pkg>@latest`, and never refreshes it — the provider stayed on that old copy while
+  // the plugin itself was upgraded.
+  if (here.includes("/node_modules/opencode-claude-code-acpbridge/")) {
+    const version = ownVersion(here);
+    return version ? `opencode-claude-code-acpbridge@${version}` : "opencode-claude-code-acpbridge";
+  }
   // dev / local install → the built entrypoint (importable from both Bun and Node,
   // unlike the package directory which only Bun resolves)
   return `file://${join(dirname(here), "..", "index.js")}`;
+}
+
+/** `version` of the package `here` belongs to (`<root>/dist/plugin/index.js`). */
+function ownVersion(here: string): string | undefined {
+  try {
+    return JSON.parse(readFileSync(join(dirname(here), "..", "..", "package.json"), "utf8")).version;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Strip plugin-only keys; the rest are the provider/agent options passed to the factory. */

@@ -6,6 +6,18 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 > **OpenCode V2 only since 0.9.0.** Versions 0.9.0 and later load only in OpenCode V2. If you
 > are still on OpenCode V1, stay on 0.8.x. See [MIGRATION_V2.md](MIGRATION_V2.md).
 
+## [0.11.4] — 2026-11-06
+
+### Fixed
+
+- **The provider is the same version as the plugin.** The plugin registered its provider
+  as `aisdk:opencode-claude-code-acpbridge`, unversioned. OpenCode installs such a spec once,
+  into `opencode-claude-code-acpbridge@latest`, and never refreshes it, so upgrading the
+  plugin left the provider — the turn handling, recovery and session directory — on whatever
+  version was installed first. The provider is now registered pinned to the plugin's own
+  version. If you upgraded from an earlier version, every fix since your first install takes
+  effect only now.
+
 ## [0.11.3] — 2026-11-06
 
 ### Fixed
