@@ -6,6 +6,19 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 > **OpenCode V2 only since 0.9.0.** Versions 0.9.0 and later load only in OpenCode V2. If you
 > are still on OpenCode V1, stay on 0.8.x. See [MIGRATION_V2.md](MIGRATION_V2.md).
 
+## [0.12.0] — 2026-11-25
+
+### Added
+
+- **Claude Code's memory without a permission prompt** (`memoryAccess`, default `true`).
+  Claude Code keeps its auto memory in `<configDir>/projects/<project>/memory/`. Under the
+  bridge it reads and writes it with OpenCode's tools, so every access asked for
+  `external_directory`. The plugin now allows those requests for the Claude Code agents
+  through a `permission.evaluate` hook. It only turns `ask` into `allow`, only when every
+  requested path is inside a project's memory directory (not the transcripts next to it),
+  and a deny you configure still wins, since OpenCode evaluates configured denies first.
+  The root follows `configDir` (`~/.claude` by default, or `CLAUDE_CONFIG_DIR`).
+
 ## [0.11.4] — 2026-11-06
 
 ### Fixed

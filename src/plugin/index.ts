@@ -12,6 +12,7 @@ import { detectClaudeExecutable } from "../provider/factory.js";
 
 import { logger } from "../log.js";
 import { compatibilityWarnings, duplicateWarning } from "./compat.js";
+import { applyMemoryAccess, claudeConfigRoot, type MemoryEvaluation } from "./memory-access.js";
 
 const log = logger("acp-plugin");
 const dbg = log.dbg;
@@ -80,7 +81,7 @@ function ownVersion(here: string): string | undefined {
 
 /** Strip plugin-only keys; the rest are the provider/agent options passed to the factory. */
 function providerOptions(opts: Record<string, any>): Record<string, any> {
-  const { name: _n, npm: _npm, providerId: _p, models: _m, agents: _a, agentModel: _am, pairModels: _pm, ...rest } = opts;
+  const { name: _n, npm: _npm, providerId: _p, models: _m, agents: _a, agentModel: _am, pairModels: _pm, memoryAccess: _ma, ...rest } = opts;
   return rest;
 }
 
@@ -380,6 +381,20 @@ export const ACPPlugin = Plugin.define({
       { providerID: providerId },
     );
 
+    // Claude Code's auto memory (`<configDir>/projects/<slug>/memory/`), reached through
+    // OpenCode's tools: allowed without asking for the claude-* agents (see memory-access.ts).
+    const memoryRoot = claudeConfigRoot(opts.claudeCode ?? {});
+    const memory = opts.memoryAccess === false
+      ? undefined
+      : await ctx.permission.hook("evaluate", (event) => {
+          try {
+            if (applyMemoryAccess(event as MemoryEvaluation, memoryRoot, (agent) => pairing.acpAgents.has(agent)))
+              dbg(`memory access allowed for ${event.agent}: ${event.resources.join(", ")}`);
+          } catch (e) {
+            dbg(`memory access check failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        });
+
     // Rewinding a conversation truncates OpenCode's history, but the Claude Code
     // session on the other side still remembers every undone turn. Drop the
     // registry link so the next turn starts a clean agent session instead of
@@ -499,6 +514,7 @@ export const ACPPlugin = Plugin.define({
       await compaction.dispose();
       await generate.dispose();
       await title.dispose();
+      await memory?.dispose();
       await events;
     };
   },
