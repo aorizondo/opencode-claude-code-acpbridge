@@ -100,6 +100,7 @@ export function createFakeAgent(opts = {}) {
           promptCapabilities: { image: true, embeddedContext: true },
           _meta: { claudeCode: { promptQueueing: queueing } },
         },
+        ...(opts.agentInfo ? { agentInfo: opts.agentInfo } : {}),
       };
     },
     async newSession(params) {
@@ -184,7 +185,18 @@ export function createFakeAgent(opts = {}) {
 
   const c2a = new TransformStream();
   const a2c = new TransformStream();
-  conn = new AgentSideConnection(() => impl, ndJsonStream(a2c.writable, c2a.readable));
+  // The ACP schema this repo builds against predates `cursorId`, so the connection strips it
+  // from `session/fork` before `impl` sees it; the raw request is logged as `forkRaw`.
+  const dec = new TextDecoder();
+  const sniffed = c2a.readable.pipeThrough(new TransformStream({
+    transform(chunk, ctl) {
+      for (const l of dec.decode(chunk, { stream: true }).split("\n")) {
+        try { const m = JSON.parse(l); if (m?.method === "session/fork") emit({ type: "forkRaw", params: m.params }); } catch { /* partial line */ }
+      }
+      ctl.enqueue(chunk);
+    },
+  }));
+  conn = new AgentSideConnection(() => impl, ndJsonStream(a2c.writable, sniffed));
 
   const update = (sessionId, u) => conn.sessionUpdate({ sessionId, update: u });
 

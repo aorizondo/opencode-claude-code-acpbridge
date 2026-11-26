@@ -26,7 +26,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { Writable, Readable } from "node:stream";
 import { randomBytes } from "node:crypto";
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -50,8 +49,10 @@ import { addAlwaysRule, evaluate as evaluateBridge } from "../plugin/bridge-rule
 import { DEBUG, logger } from "../log.js";
 import { record, recording, sanitizePrompt } from "./recorder.js";
 import {
-  anchorsOf, classifyAnchors, classifyHistory, firstUserText, hashText, historyOf, isTransient, msgKey, stripInjected, systemText,
+  anchorsHash, anchorsOf, classifyAnchors, classifyHistory, firstUserText, hashText, historyOf, isTransient, msgKey,
+  pickCheckpoint, prefixHash, sharedExtent, stripInjected, systemText, verifiedCheckpoint, type Checkpoint,
 } from "./history.js";
+import { lastAssistantUuid, transcriptPath, userAfter } from "./transcript.js";
 
 const log = logger("acp-orchestrator");
 const dbg = log.dbg;
@@ -74,6 +75,10 @@ const CATCHUP_RESULT_CHARS = 8000;
 /** Ceiling for a full-history replay into a new session (~100k tokens): beyond it the
  *  oldest turns are dropped — a 656k-char replay was seen in the wild. */
 const REPLAY_BUDGET_CHARS = 400_000;
+/** A full replay smaller than this goes out in one prompt (re-replaying it is cheap). */
+const SPLIT_REPLAY_MIN_CHARS = 20_000;
+/** Longest a context-only replay turn may take before the replay is sent whole instead. */
+const PRIME_TIMEOUT_MS = 5 * 60_000;
 /** Tope del buffer `pending` (chunks emitidos sin controller vivo): sin cap un turno
  *  largo con el stream cerrado lo haría crecer sin límite (OOM). */
 const MAX_PENDING_PARTS = 1000;
@@ -122,6 +127,17 @@ function isInterrupted(output: any): boolean {
   const text = typeof v === "string" ? v : v != null ? JSON.stringify(v) : "";
   if (/"type"\s*:\s*"aborted"/.test(text)) return true;
   return /^(Tool execution interrupted|Tool result missing)/.test(text.trim());
+}
+
+/** Whether the agent cuts a fork at an ACP cursor (see `forkByCursor`). `auto` decides by the
+ *  agent's version: the cursor fork arrived in claude-agent-acp 0.109; an agent that doesn't
+ *  report one keeps the `resumeSessionAt` way. */
+export function forkUsesCursor(setting: string | undefined, version: unknown): boolean {
+  if (setting === "cursor") return true;
+  if (setting === "resumeSessionAt") return false;
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? ""));
+  if (!m) return false;
+  return Number(m[1]) > 0 || Number(m[2]) >= 109;
 }
 
 function ownTextKey(text: string): string {
@@ -181,6 +197,10 @@ interface TurnState {
   /** Context occupancy of the latest request (`usage_update.used`): what OpenCode
    *  must see to decide on compaction. 0 right after a compaction. */
   contextUsed?: number;
+  /** Context window of the session (`usage_update.size`). */
+  contextSize?: number;
+  /** Context occupancy when acpbridge last ran a `/compact` on its own (see selfCompact). */
+  selfCompactedAt?: number;
   /** OpenCode session id — kept so end-of-turn can persist `lastUsage` to the registry. */
   ocSession?: string;
   /** Session of an OpenCode subagent (`x-parent-session-id`): short idle TTL. */
@@ -249,13 +269,15 @@ interface TurnState {
   stepTimer: ReturnType<typeof setTimeout> | null;
   /** smartRevert: for each user message that opened a turn (its history index), the
    *  uuid of Claude's last transcript entry BEFORE it — where a revert can fork back to. */
-  checkpoints: Array<{ at: number; uuid: string }>;
+  checkpoints: Checkpoint[];
   /** Native tool calls in flight (Task/Agent, WebSearch, Skill…), by ACP toolCallId. */
   nativeCalls: Map<string, { toolName?: string; title?: string; parent?: string }>;
   /** A native `/compact` is running after an OpenCode compaction (v2): its output is
    *  hidden and the next turn waits for it. */
   compacting: Promise<void> | null;
   hidden: boolean;
+  /** A context-only replay turn is running (split replay): tool calls are refused. */
+  priming?: boolean;
   /** The session compacted itself in step with OpenCode: the next history, which starts
    *  at OpenCode's checkpoint, is adopted instead of starting over. */
   adoptCheckpoint: boolean;
@@ -455,6 +477,10 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
   private promptCaps: Record<string, boolean> = {};
   /** The agent merges a prompt sent mid-turn into the running turn (claude-agent-acp). */
   private promptQueueing = false;
+  /** How a fork is cut at a checkpoint: by ACP `cursorId` (claude-agent-acp ≥ 0.109: the fork
+   *  copies the transcript with FRESH uuids, so `resumeSessionAt` of the source no longer
+   *  exists in it) or by `resumeSessionAt` in the creation options (older agents). */
+  private forkByCursor = false;
   /** The agent has no session/set_model: models go through the `model` config option. */
   private modelByConfig = false;
 
@@ -546,7 +572,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
         // Without queueing it rides on the last tool result instead.
         // Keep the registry in step mid-turn too: a restart now resumes right here
         // instead of replaying every tool round-trip since the user's message.
-        if (t.ocSession) setLink(t.ocSession, t.sessionId, t.sentKeys.length, t.convKey, t.ownPrefixes, t.cwd);
+        this.persistLink(t, t.sentKeys.length, t.sentAnchors);
         const extraBlocks = continuation.extras.length ? this.midTurnBlocks(t, continuation.extras) : [];
         const results = continuation.results;
         const lastTool = results.map((r) => !t.pendingPermissions.has(r.toolCallId)).lastIndexOf(true);
@@ -702,12 +728,19 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
         // fork the session at Claude's state right before it. Nothing is replayed and the
         // shared prefix stays cached; anything unexpected falls back to a new session.
         if (cls.kind !== "append" && ctrl.smartRevert !== false) {
-          const at = classifyHistory(t.sentKeys, keys).fromIndex;
-          const cp = t.checkpoints.find((c) => c.at === at);
-          if (cp && (await this.forkInPlace(t, ctrl, tools, systemMode, options.prompt, cfgKey, { resumeSessionAt: cp.uuid }, "revert"))) {
+          // Anchors (not the legacy per-message keys) locate the rewind point in v2/shadow-v2:
+          // the legacy key of an old, re-rendered message would put it far too early.
+          const cur = t;
+          const legacyAt = classifyHistory(cur.sentKeys, keys).fromIndex;
+          const cp = mode === "v2"
+            ? pickCheckpoint(cur.checkpoints, sharedExtent(cur.sentAnchors, hist))
+            : cur.checkpoints.find((c) => c.at === legacyAt);
+          if (!cp) dbg(`smartRevert: no checkpoint for the rewind (extent ${mode === "v2" ? sharedExtent(cur.sentAnchors, hist) : legacyAt}, hist ${hist.length}, checkpoints [${cur.checkpoints.map((c) => c.at).join(",")}])`);
+          if (cp && (await this.forkInPlace(t, ctrl, tools, systemMode, options.prompt, cfgKey, undefined, "revert", cp))) {
+            const at = cp.at;
             this.markKnown(t, hist.slice(0, at));
             t.checkpoints = t.checkpoints.filter((c) => c.at < at);
-            this.decide(options, { decision: "smart-revert", session: t.sessionId, at, uuid: cp.uuid });
+            this.decide(options, { decision: "smart-revert", session: t.sessionId, at, uuid: cp.uuid, from: cp.sid });
             cls = { kind: "append", fromIndex: at };
           }
         }
@@ -750,7 +783,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
           });
           if (ctrl.smartRevert !== false) this.recordCheckpoint(live, hist, cls.fromIndex);
           this.markKnown(live, hist);
-          if (ocSession) setLink(ocSession, live.sessionId, hist.length, convKey, live.ownPrefixes, live.cwd);
+          this.persistLink(live, hist.length, live.sentAnchors);
           this.sendPrompt(live, blocks.length ? blocks : [{ type: "text", text: "" }]);
           return;
         }
@@ -783,11 +816,15 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     // history grew rather than diverged) → no history replay (saves tokens). Else
     // create a fresh session and replay the full history.
     const resumeId: string | undefined = po.resumeId;
-    const resumeLen: number = typeof po.resumeLen === "number" ? po.resumeLen : 0;
+    let resumeLen: number = typeof po.resumeLen === "number" ? po.resumeLen : 0;
     const resumePrefixes: string[] = Array.isArray(po.resumeIdPrefixes) ? po.resumeIdPrefixes.map(String) : [];
+    const resumeCps: Checkpoint[] = Array.isArray(po.resumeCheckpoints)
+      ? po.resumeCheckpoints.filter((c: any) => c && typeof c.uuid === "string" && typeof c.sid === "string" && typeof c.at === "number")
+      : [];
     let sessionId: string | undefined;
     let replayFull = true;
     let defaultEffort: string | undefined;
+    let carriedCps: Checkpoint[] = [];
     // A registry entry for a DIFFERENT conversation (first message changed: compaction,
     // or a reused id) must not be resumed — the agent would carry the wrong context.
     const sameConv = !po.resumeConvKey || po.resumeConvKey === convKey;
@@ -796,26 +833,64 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     // resumed where it was created: its transcript lives under that directory's slug, and
     // entries from before the registry kept one were all created in the default.
     let cwd = this.sessionCwd(po);
-    if (resumeId && sameConv && resumeLen > 0 && hist.length > resumeLen) {
+    if (resumeId && sameConv && resumeLen > 0) {
       const resumeCwd = typeof po.resumeCwd === "string" && po.resumeCwd ? po.resumeCwd : this.defaultCwd();
-      try {
-        const resumed = await this.connection.unstable_resumeSession({
-          sessionId: resumeId,
-          cwd: resumeCwd,
-          mcpServers: [serverConfig],
-          // Re-apply the clean-brain options on resume too. Without this the agent
-          // falls back to its defaults (--tools default, --setting-sources=user,
-          // project,local, no --strict-mcp-config) and the resumed session regains
-          // native tools + the claude.ai connectors.
-          _meta: { claudeCode: { options: buildClaudeCodeOptions(ctrl) } },
-        } as any);
-        sessionId = resumeId;
-        replayFull = false;
-        cwd = resumeCwd;
-        defaultEffort = effortOption(resumed);
-        dbg(`resume ${resumeId} (oc=${ocSession ?? "?"}) — no history replay`);
-      } catch (e) {
-        dbg(`resume ${resumeId} failed (${e instanceof Error ? e.message : String(e)}) — fresh session`);
+      // The registry proves what the agent session holds (`sentHash`): a history that no
+      // longer starts with it was rewound, and resuming would bring the undone turns back.
+      const rewound = typeof po.resumeSentHash === "string" && prefixHash(hist, resumeLen) !== po.resumeSentHash;
+      if (!rewound && hist.length > resumeLen) {
+        try {
+          const resumed = await this.connection.unstable_resumeSession({
+            sessionId: resumeId,
+            cwd: resumeCwd,
+            mcpServers: [serverConfig],
+            // Re-apply the clean-brain options on resume too. Without this the agent
+            // falls back to its defaults (--tools default, --setting-sources=user,
+            // project,local, no --strict-mcp-config) and the resumed session regains
+            // native tools + the claude.ai connectors.
+            _meta: { claudeCode: { options: buildClaudeCodeOptions(ctrl) } },
+          } as any);
+          sessionId = resumeId;
+          replayFull = false;
+          cwd = resumeCwd;
+          carriedCps = resumeCps;
+          defaultEffort = effortOption(resumed);
+          dbg(`resume ${resumeId} (oc=${ocSession ?? "?"}) — no history replay`);
+        } catch (e) {
+          dbg(`resume ${resumeId} failed (${e instanceof Error ? e.message : String(e)}) — fresh session`);
+        }
+      } else if (rewound && ctrl.smartRevert !== false) {
+        // Rewound while no process held the session (restart, idle eviction): fork the
+        // transcript at the newest rewind point the history still matches.
+        const cp = verifiedCheckpoint(resumeCps, hist);
+        if (!cp) {
+          // Why no rewind point matched: each checkpoint's recorded prefix hash against the incoming one.
+          const anchors = anchorsOf(hist);
+          const seen = resumeCps.map((c) => {
+            const n = anchors.filter((x) => x.at < c.at).length;
+            return `${c.at}:${c.h ?? "-"}→${anchorsHash(anchors.slice(0, n).map((x) => x.key))}`;
+          });
+          dbg(`smartRevert: no registry checkpoint matches (hist ${hist.length}, sent ${resumeLen}, ${po.resumeSentHash}→${prefixHash(hist, resumeLen)}; checkpoints ${seen.join(" ") || "none"})`);
+        }
+        if (cp) {
+          const meta: any = { claudeCode: { options: buildClaudeCodeOptions(ctrl) } };
+          const sysMeta = this.buildSystemPromptMeta(options.prompt, systemMode);
+          if (sysMeta !== undefined) meta.systemPrompt = sysMeta;
+          try {
+            const forked = await this.forkSessionAt(resumeId, resumeCwd, [serverConfig], meta, cp);
+            if (!forked?.sessionId) throw new Error("fork returned no sessionId");
+            sessionId = forked.sessionId;
+            replayFull = false;
+            cwd = resumeCwd;
+            resumeLen = cp.at;
+            carriedCps = resumeCps.filter((c) => c.at < cp.at);
+            defaultEffort = effortOption(forked);
+            this.decide(options, { decision: "smart-revert", session: sessionId, at: cp.at, uuid: cp.uuid, from: cp.sid, source: "registry" });
+            note(`session ${cp.sid} → fork ${sessionId} (revert after a restart, context kept) — resumable with: claude --resume ${sessionId}`);
+          } catch (e) {
+            dbg(`fork of ${cp.sid} at ${cp.uuid} failed (${e instanceof Error ? e.message : String(e)}) — fresh session`);
+          }
+        }
       }
     }
     if (!sessionId) {
@@ -883,7 +958,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       stepTimer: null,
       queuedItems: [],
       nativeCalls: new Map(),
-      checkpoints: [],
+      checkpoints: carriedCps,
       compacting: null,
       hidden: false,
       adoptCheckpoint: false,
@@ -899,15 +974,41 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     this.evictIdleSessions();
     this.startSweeper();
     await this.applySessionConfig(t, ctrl);
-    if (ocSession) setLink(ocSession, sessionId, hist.length, convKey, t.ownPrefixes, t.cwd);
+    // The state of the agent before the tail goes out: where a later revert can rewind to.
+    if (!replayFull && ctrl.smartRevert !== false) this.recordCheckpoint(t, hist, resumeLen);
+    this.persistLink(t, hist.length, anchorsOf(hist).map((a) => a.key));
     // Resume: the registry may lag behind (process died mid-turn), and the agent's own
     // last answer follows the recorded point — the resumed session already has it.
     const tail = replayFull ? hist : this.dropOwnLead(t, hist.slice(resumeLen));
     if (DEBUG && !replayFull) dbg(`resume — catch-up ${tail.length} msg(s)`);
+    const ctxBlocks = this.contextBlocks(t, options.prompt, ctrl);
     const promptBlocks = [
-      ...this.contextBlocks(t, options.prompt, ctrl),
+      ...ctxBlocks,
       ...(tail.length ? this.blocksFor(tail, t, replayFull ? "replay" : "tail") : [{ type: "text", text: "" }]),
     ];
+    // Split replay: a replayed history is ONE transcript entry, so a later revert to the
+    // prompt that came with it had nowhere to fork and replayed everything again (and again).
+    // The history goes first as a hidden, context-only turn; the prompt follows as a normal
+    // turn, with a checkpoint right before it.
+    const split = replayFull ? this.replaySplit(hist, ctrl, promptBlocks) : -1;
+    if (split > 0) {
+      const histBlocks = [...ctxBlocks, ...this.replayBlocks(hist.slice(0, split), t, true)];
+      this.decide(options, {
+        decision: "new", session: sessionId, keys: keys.length, tail: tail.length,
+        chars: blocksChars(promptBlocks), split, primeChars: blocksChars(histBlocks),
+      });
+      this.markKnown(t, hist);
+      if (await this.primeReplay(t, histBlocks)) {
+        this.recordCheckpoint(t, hist, split);
+        this.persistLink(t, hist.length, anchorsOf(hist).map((a) => a.key));
+        this.sendPrompt(t, this.blocksFor(hist.slice(split), t, "tail"));
+        return;
+      }
+      if (t.aborted) return;
+      note(`session ${sessionId}: context-only replay turn failed — sending the whole replay at once`);
+      this.sendPrompt(t, promptBlocks);
+      return;
+    }
     this.decide(options, {
       decision: replayFull ? "new" : "resume", session: sessionId, keys: keys.length,
       tail: tail.length, chars: blocksChars(promptBlocks),
@@ -916,13 +1017,71 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     this.sendPrompt(t, promptBlocks);
   }
 
+  /** Where a full replay is split (index of the trailing user messages = the new prompt), or
+   *  -1: only when smartRevert is on, the history ends with the user's prompt and what comes
+   *  before it is worth a fork point (`splitReplayMinChars`, default 20 000). */
+  private replaySplit(hist: any[], ctrl: ClaudeCodeControl, blocks: any[]): number {
+    if (ctrl.smartRevert === false || ctrl.splitReplay === false) return -1;
+    let cut = hist.length;
+    while (cut > 0 && hist[cut - 1].role === "user") cut--;
+    if (cut === 0 || cut === hist.length) return -1;
+    return blocksChars(blocks) >= (ctrl.splitReplayMinChars ?? SPLIT_REPLAY_MIN_CHARS) ? cut : -1;
+  }
+
+  /** Context-only turn (output hidden, tools refused): the replayed history lands in the
+   *  agent's session as a turn of its own. False when it didn't end normally in time. */
+  private async primeReplay(t: TurnState, blocks: any[]): Promise<boolean> {
+    t.hidden = true;
+    t.priming = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), PRIME_TIMEOUT_MS); });
+      const resp: any = await Promise.race([this.connection.prompt({ sessionId: t.sessionId, prompt: blocks }), timeout]);
+      if (resp === "timeout") {
+        try { await this.connection.cancel({ sessionId: t.sessionId }); } catch { /* ignore */ }
+        return false;
+      }
+      dbg(`context-only replay turn of ${t.sessionId}: ${resp?.stopReason}`);
+      return resp?.stopReason === "end_turn";
+    } catch (e) {
+      dbg(`context-only replay turn of ${t.sessionId} failed (${errorText(e)})`);
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+      t.hidden = false;
+      t.priming = false;
+    }
+  }
+
+  /** Directory Claude Code keeps its projects (and transcripts) in. */
+  private claudeConfigDir(): string {
+    return resolveConfigDir(this.config.claudeCode ?? {}) ?? join(homedir(), ".claude");
+  }
+
+  /** `session/fork`. Without `at`: the whole session of `sessionId`. With a checkpoint: the
+   *  session the checkpoint was taken in (`at.sid`), cut right before the turn that followed it.
+   *  Throws when the point can't be located (the caller falls back to a new session). */
+  private async forkSessionAt(sessionId: string, cwd: string, mcpServers: any[], meta: any, at?: Checkpoint): Promise<any> {
+    const params: any = { sessionId: at?.sid ?? sessionId, cwd, mcpServers, _meta: meta };
+    if (at) {
+      if (this.forkByCursor) {
+        const user = userAfter(transcriptPath(this.claudeConfigDir(), cwd, at.sid), at.uuid);
+        if (!user) throw new Error(`no prompt after transcript entry ${at.uuid} of ${at.sid}`);
+        params.cursorId = `before:${user}`;
+      } else {
+        meta.claudeCode = { ...meta.claudeCode, options: { ...meta.claudeCode?.options, resumeSessionAt: at.uuid } };
+      }
+    }
+    return this.connection.unstable_forkSession(params);
+  }
+
   /** Swap `t` onto a fork of its ACP session created with the current profile. The
    *  fork carries the whole transcript, so what `t` knows (sentKeys, own output) still
    *  holds; it gets its own MCP host. The old session is closed. */
   private async forkInPlace(
     t: TurnState, ctrl: ClaudeCodeControl, tools: McpToolDef[], systemMode: string,
     prompt: LanguageModelV3CallOptions["prompt"], cfgKey: string, extra?: Record<string, unknown>,
-    why = "agent profile changed",
+    why = "agent profile changed", at?: Checkpoint,
   ): Promise<boolean> {
     if (t.inflight || t.pendingTools.size || t.pendingPermissions.size) {
       this.abortTurn(t, why);
@@ -936,12 +1095,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       const meta: any = { claudeCode: { options: { ...buildClaudeCodeOptions(ctrl), ...(extra ?? {}) } } };
       const sysMeta = this.buildSystemPromptMeta(prompt, systemMode);
       if (sysMeta !== undefined) meta.systemPrompt = sysMeta;
-      const res = await this.connection.unstable_forkSession({
-        sessionId: t.sessionId,
-        cwd: t.cwd, // the source transcript is found under its own directory's slug
-        mcpServers: [host.getServerConfig()],
-        _meta: meta,
-      });
+      const res = await this.forkSessionAt(t.sessionId, t.cwd, [host.getServerConfig()], meta, at);
       if (!res?.sessionId) throw new Error("fork returned no sessionId");
       const old = { id: t.sessionId, host: t.host };
       this.byAcpSession.delete(old.id);
@@ -1042,33 +1196,18 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     let at = from;
     while (at < hist.length && hist[at].role !== "user") at++;
     if (at >= hist.length || t.checkpoints.some((c) => c.at === at)) return;
-    const uuid = this.lastAssistantUuid(t);
-    if (uuid) t.checkpoints.push({ at, uuid });
+    const uuid = lastAssistantUuid(transcriptPath(this.claudeConfigDir(), t.cwd, t.sessionId));
+    if (uuid) t.checkpoints.push({ at, uuid, sid: t.sessionId, h: prefixHash(hist, at) });
   }
 
-  /** uuid of the last main-thread assistant entry in the session's transcript
-   *  (`<configDir>/projects/<cwd as slug>/<sessionId>.jsonl`), read from its tail. */
-  private lastAssistantUuid(t: TurnState): string | undefined {
-    try {
-      const dir = resolveConfigDir(this.config.claudeCode ?? {}) ?? join(homedir(), ".claude");
-      const slug = t.cwd.replace(/[^a-zA-Z0-9]/g, "-");
-      const file = join(dir, "projects", slug, `${t.sessionId}.jsonl`);
-      const fd = openSync(file, "r");
-      try {
-        const size = fstatSync(fd).size;
-        const len = Math.min(size, 256 * 1024);
-        const buf = Buffer.alloc(len);
-        readSync(fd, buf, 0, len, size - len);
-        const lines = buf.toString("utf8").split("\n");
-        for (let i = lines.length - 1; i >= 0; i--) {
-          try {
-            const e = JSON.parse(lines[i]);
-            if (e?.type === "assistant" && typeof e.uuid === "string" && !e.isSidechain) return e.uuid;
-          } catch { /* partial first line */ }
-        }
-      } finally { closeSync(fd); }
-    } catch { /* no transcript (other configDir, agent not writing one) */ }
-    return undefined;
+  /** Keep the registry in step: where the agent session is up to (length + proof) and its
+   *  rewind points, so a new process can resume it — or fork it at a revert. */
+  private persistLink(t: TurnState, len: number, anchorKeys: readonly string[]) {
+    if (!t.ocSession) return;
+    setLink(t.ocSession, t.sessionId, len, t.convKey, t.ownPrefixes, t.cwd, {
+      sentHash: anchorsHash(anchorKeys),
+      checkpoints: t.checkpoints.slice(-48),
+    });
   }
 
   /** Free the agent-side session (its Claude Code process and MCP servers). The client
@@ -1097,6 +1236,24 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     t.afterTurn = mode === "v2" ? () => this.nativeCompact(t) : null;
     this.sendPrompt(t, this.lastUserBlocks(options.prompt));
     return true;
+  }
+
+  /** Claude Code compacts at `autoCompactPct` on its own — except in a fork (it ignores
+   *  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE there) and in a few other cases where it waits for the
+   *  model's whole window. Every request re-reads the context, so a session left to grow
+   *  to ~1M is the most expensive kind. After a turn whose context is past the threshold,
+   *  the session is compacted here (hidden `/compact`; the next turn waits for it). */
+  private selfCompact(t: TurnState) {
+    const ctrl = this.config.claudeCode ?? {};
+    const pct = ctrl.autoCompactPct ?? 75;
+    const used = t.contextUsed, size = t.contextSize;
+    if (!pct || ctrl.selfCompact === false || !used || !size || t.compacting || t.hidden) return;
+    if (used < (size * pct) / 100) return;
+    // Didn't shrink last time: try again only once it has grown another 10 %.
+    if (t.selfCompactedAt && used < t.selfCompactedAt * 1.1) return;
+    t.selfCompactedAt = used;
+    note(`session ${t.sessionId}: context ${used}/${size} past ${pct}% — compacting it (native /compact)`);
+    this.nativeCompact(t);
   }
 
   /** Native `/compact` of the live session, output hidden. */
@@ -1359,6 +1516,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     const after = t.afterTurn;
     t.afterTurn = null;
     after?.();
+    if (!after) this.selfCompact(t);
     // A tool-less side call (title/summary in programmatic use) never continues.
     if (t.key.endsWith(":notools")) queueMicrotask(() => this.endTurn(t));
   }
@@ -1395,6 +1553,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
    *  resolved here: it waits for OpenCode to run the tool and send the continuation. */
   private onToolCall(t: TurnState, call: { toolCallId: string; name: string; args: Record<string, unknown> }) {
     if (t.aborted) { t.host.rejectToolCall(call.toolCallId, "Turn aborted"); return; }
+    if (t.priming) { t.host.rejectToolCall(call.toolCallId, "Context-only turn: no tools now. Reply with exactly: OK"); return; }
     dbg(`agent → tool-call ${call.name} (${call.toolCallId}) → emit to OpenCode`);
     t.pendingTools.add(call.toolCallId);
     // `call.args` puede traer refs circulares/BigInt → JSON.stringify lanzaría y
@@ -1681,6 +1840,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     switch (update?.sessionUpdate) {
       case "usage_update":
         if (typeof update.used === "number") t.contextUsed = update.used;
+        if (typeof update.size === "number" && update.size > 0) t.contextSize = update.size;
         break;
       case "agent_message_chunk":
         if (update.content?.type === "text") {
@@ -1961,6 +2121,7 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     });
     this.promptCaps = (initResult?.agentCapabilities?.promptCapabilities ?? {}) as Record<string, boolean>;
     this.promptQueueing = !!initResult?.agentCapabilities?._meta?.claudeCode?.promptQueueing;
+    this.forkByCursor = forkUsesCursor(this.config.claudeCode?.smartRevertFork, initResult?.agentInfo?.version);
     dbg(`connected to agent — promptCapabilities: ${JSON.stringify(this.promptCaps)}`);
   }
 
@@ -2139,9 +2300,9 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     return blocks;
   }
 
-  private replayBlocks(msgs: any[], t: TurnState | null): any[] {
+  private replayBlocks(msgs: any[], t: TurnState | null, contextOnly = false): any[] {
     let cut = msgs.length;
-    while (cut > 0 && msgs[cut - 1].role === "user") cut--;
+    if (!contextOnly) while (cut > 0 && msgs[cut - 1].role === "user") cut--;
     const current = msgs.slice(cut).flatMap((m) => this.messageToBlocks(m, false, t));
     let rendered = msgs.slice(0, cut).map((m) => this.renderMessage(m, t)).filter((b) => b.length);
     if (!rendered.length) return current;
@@ -2157,7 +2318,9 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       ...(omitted ? [{ type: "text", text: `<omitted messages="${omitted}" reason="replay budget"/>` }] : []),
       ...rendered.slice(1).flat(),
       { type: "text", text: "</conversation_history>" },
-      ...(current.length ? current : [{ type: "text", text: "(Continue the conversation above.)" }]),
+      ...(contextOnly
+        ? [{ type: "text", text: "(This turn only restores context; the user's next message follows. Do not run any tool and do not act on the history. Reply with exactly: OK)" }]
+        : current.length ? current : [{ type: "text", text: "(Continue the conversation above.)" }]),
     ];
   }
 

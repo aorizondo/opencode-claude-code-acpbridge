@@ -405,7 +405,8 @@ test("FORMAT: another model's turn reaches the agent labelled as such, not as it
 });
 
 test("FORMAT: a full replay is a bounded <conversation_history> followed by the current request", async () => {
-  const { agent, model, done } = setup();
+  // In one prompt (splitReplay off): the split variant is covered in revert.test.mjs.
+  const { agent, model, done } = setup({ claudeCode: { splitReplay: false } });
   try {
     const big = "x".repeat(150_000);
     const h = [SYS, user("TAREA-INICIAL"), asst(`A1 ${big}`), user("m2"), asst(`A2 ${big}`), user("m3"), asst(`A3 ${big}`), user("PETICION-ACTUAL")];

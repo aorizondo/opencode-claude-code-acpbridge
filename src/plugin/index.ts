@@ -360,6 +360,8 @@ export const ACPPlugin = Plugin.define({
           if (link.convKey) event.options.resumeConvKey = link.convKey;
           if (link.idPrefixes?.length) event.options.resumeIdPrefixes = link.idPrefixes;
           if (link.cwd) event.options.resumeCwd = link.cwd;
+          if (link.sentHash) event.options.resumeSentHash = link.sentHash;
+          if (link.checkpoints?.length) event.options.resumeCheckpoints = link.checkpoints;
         }
         const extra = agentOptions.get(String(event.agent));
         if (extra) for (const [k, v] of Object.entries(extra)) event.options[k] = v;
@@ -461,7 +463,13 @@ export const ACPPlugin = Plugin.define({
             continue;
           }
           if (event.type !== "session.revert.committed" && event.type !== "session.revert.cleared") continue;
-          if (clearLink(sessionID)) {
+          // A link that carries the history hash is verified by the provider against the
+          // incoming prompt (a rewound history no longer matches), and its checkpoints are
+          // what lets the revert fork the Claude Code session instead of replaying into a
+          // new one — so it stays. Older links can't be verified: dropped as before.
+          if (getLink(sessionID)?.sentHash) {
+            dbg(`session ${sessionID} rewound — link kept, the provider verifies it against the history`);
+          } else if (clearLink(sessionID)) {
             dbg(`session ${sessionID} rewound — link dropped, next turn starts fresh`);
           }
         }

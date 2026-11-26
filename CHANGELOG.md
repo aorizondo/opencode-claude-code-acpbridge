@@ -6,6 +6,41 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 > **OpenCode V2 only since 0.9.0.** Versions 0.9.0 and later load only in OpenCode V2. If you
 > are still on OpenCode V1, stay on 0.8.x. See [MIGRATION_V2.md](MIGRATION_V2.md).
 
+## [Unreleased]
+
+## [0.13.0] — 2026-11-26
+
+### Fixed
+
+- smartRevert with claude-agent-acp ≥ 0.109: its fork copies the transcript with fresh uuids, so
+  `resumeSessionAt` (a uuid of the source) no longer existed in the fork and every revert fell back
+  to a new session plus full replay. The fork is now cut with the ACP `cursorId` (`smartRevertFork`:
+  `auto` by agent version, `cursor`, `resumeSessionAt`). Checkpoints remember the session whose
+  transcript holds them, so a second revert after a fork still works.
+- In `historyMode: "v2"` the rewind point comes from the anchors, not from the legacy per-message keys.
+- Redaction markers (opencode-apex `[SECRET:name:<random iv + ciphertext>]`) change on every request;
+  they are normalized out of the history keys, so an old message holding a secret no longer looks
+  "diverged" every turn.
+- Checkpoints are read with a growing tail window (a 256 KB tail could hold no assistant entry).
+
+### Added
+
+- The registry keeps the history hash and the rewind points of each session: a revert after a
+  restart or an idle eviction forks the registered session (`smart-revert`, `source: "registry"`)
+  instead of replaying the whole history, and a revert no longer drops the link.
+- **Split replay** (`splitReplay`, default on; `splitReplayMinChars`, default 20 000). A full replay
+  is one transcript entry, so reverting the prompt that came with it had nowhere to fork: it replayed
+  everything again, and every later revert of that prompt did the same. The history now goes first
+  as a hidden, context-only turn (tools refused, answer "OK" not shown), then the prompt as a normal
+  turn with a checkpoint right before it. Logged as `{"decision":"new","split":<index>}`.
+- **Self compaction** (`selfCompact`, default on). Claude Code ignores `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
+  in a forked session (every smartRevert is one) and in a few other cases waits for the model's whole
+  window, so those sessions grew towards 1M tokens re-read on every request. When a turn ends with the
+  context (`usage_update`) past `autoCompactPct`, the bridge runs a hidden native `/compact`; the next
+  turn waits for it. Once per +10 % if it didn't shrink.
+- Debug lines explaining why a revert found no rewind point (extent and checkpoints; in the registry
+  path, each checkpoint's recorded vs. incoming prefix hash).
+
 ## [0.12.0] — 2026-11-25
 
 ### Added

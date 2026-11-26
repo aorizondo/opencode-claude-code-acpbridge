@@ -22,10 +22,23 @@ export function hashText(s: string): string {
 export function firstUserText(prompt: Prompt): string {
   for (const m of prompt) {
     if (m.role !== "user") continue;
-    if (typeof (m as any).content === "string") return stripInjected((m as any).content).trim();
-    return stripInjected(((m as any).content as any[]).filter((p) => p.type === "text").map((p) => p.text).join("")).trim();
+    if (typeof (m as any).content === "string") return keyText(stripInjected((m as any).content)).trim();
+    return keyText(stripInjected(((m as any).content as any[]).filter((p) => p.type === "text").map((p) => p.text).join(""))).trim();
   }
   return "";
+}
+
+/** Redaction markers (opencode-apex: `[SECRET:<pattern>:<base64url(iv||tag||ciphertext)>]`).
+ *  The IV is random, so the SAME secret in the SAME old message is re-encrypted into a
+ *  different marker on every request: the message looked different every turn and the
+ *  history "diverged" at it each time (new session + full replay). Only the pattern name
+ *  is stable, and it is all the fingerprint needs. Used for KEYS only — the text that
+ *  reaches the agent keeps its marker. */
+const SECRET_MARKER = /\[SECRET:([A-Za-z0-9_.-]+):[A-Za-z0-9_-]{16,}\]/g;
+
+/** Text as the fingerprints see it: unstable decorations normalized away. */
+export function keyText(text: string): string {
+  return text.includes("[SECRET:") ? text.replace(SECRET_MARKER, "[SECRET:$1]") : text;
 }
 
 /** The conversation proper: system messages are excluded because they're forwarded
@@ -39,10 +52,10 @@ export function historyOf(prompt: Prompt): any[] {
  *  than payloads: it must survive re-serialization but change if the turn changes. */
 export function msgKey(msg: any): string {
   let body = "";
-  if (typeof msg.content === "string") body = msg.content;
+  if (typeof msg.content === "string") body = keyText(msg.content);
   else if (Array.isArray(msg.content)) {
     for (const p of msg.content) {
-      if (p?.type === "text") body += `t:${p.text}`;
+      if (p?.type === "text") body += `t:${keyText(String(p.text ?? ""))}`;
       else if (p?.type === "tool-call") body += `c:${p.toolCallId}`;
       else if (p?.type === "tool-result") body += `r:${p.toolCallId}`;
       else if (p?.type === "file") body += `f:${p.filename ?? p.mediaType ?? ""}`;
@@ -115,7 +128,7 @@ export function userText(msg: any): string {
   const parts = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content ?? [];
   return parts
     .filter((p: any) => p?.type === "text")
-    .map((p: any) => stripInjected(String(p.text ?? "")).trim())
+    .map((p: any) => keyText(stripInjected(String(p.text ?? ""))).trim())
     .filter((t: string) => t && !IMAGE_REMOVED.test(t))
     .join("\n");
 }
@@ -153,4 +166,56 @@ export function classifyAnchors(sent: readonly string[], incoming: readonly Anch
     ? { kind: "revert", fromIndex: after }
     : { kind: "append", fromIndex: after };
   return { kind: "diverged", fromIndex: after };
+}
+
+/** Identity of a list of anchor keys, comparable across processes (the registry stores it). */
+export function anchorsHash(keys: readonly string[]): string {
+  return `${keys.length}:${hashText(keys.join("|"))}`;
+}
+
+/** Hash of the anchors of `hist.slice(0, len)`. */
+export function prefixHash(hist: readonly any[], len: number): string {
+  return anchorsHash(anchorsOf(hist.slice(0, len)).map((a) => a.key));
+}
+
+/** How much of `hist` (a message count) is certainly the conversation the agent already
+ *  has: everything before the first anchor that differs. For a pure revert that is the whole
+ *  incoming history. Unlike the legacy per-message keys it does not move when an old
+ *  assistant message is re-rendered, so it is the right fork-point reference. */
+export function sharedExtent(sent: readonly string[], hist: readonly any[]): number {
+  const incoming = anchorsOf(hist);
+  let i = 0;
+  while (i < sent.length && i < incoming.length && sent[i] === incoming[i].key) i++;
+  return i === incoming.length ? hist.length : incoming[i].at;
+}
+
+/** A point of the agent's session the conversation can be rewound to. `at` is the index (in
+ *  the non-system history) of the message that opened the turn that FOLLOWS the point, `uuid`
+ *  the last transcript entry before that turn, `sid` the agent session whose transcript holds
+ *  that uuid (forks get fresh uuids, so a point stays tied to the session it was taken in),
+ *  `h` the anchors hash of `hist.slice(0, at)` (verifies the point from another process). */
+export interface Checkpoint {
+  at: number;
+  uuid: string;
+  sid: string;
+  h?: string;
+}
+
+/** The latest checkpoint at or before `extent`. */
+export function pickCheckpoint(cps: readonly Checkpoint[], extent: number): Checkpoint | undefined {
+  let best: Checkpoint | undefined;
+  for (const c of cps) if (c.at <= extent && (!best || c.at > best.at)) best = c;
+  return best;
+}
+
+/** The latest checkpoint whose recorded prefix hash still matches the incoming history — what
+ *  lets a process that never saw the turns (restart, idle eviction) rewind to a revert point. */
+export function verifiedCheckpoint(cps: readonly Checkpoint[], hist: readonly any[]): Checkpoint | undefined {
+  const anchors = anchorsOf(hist);
+  const sorted = [...cps].filter((c) => c.h && c.at <= hist.length).sort((a, b) => b.at - a.at);
+  for (const c of sorted) {
+    const n = anchors.filter((a) => a.at < c.at).length;
+    if (anchorsHash(anchors.slice(0, n).map((a) => a.key)) === c.h) return c;
+  }
+  return undefined;
 }

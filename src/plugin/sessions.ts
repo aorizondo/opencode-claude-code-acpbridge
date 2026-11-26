@@ -44,12 +44,23 @@ export interface SessionLink {
    *  directory's slug, so it is resumed there. Absent in entries written before 0.11.3,
    *  all created in the provider's default directory. */
   cwd?: string;
+  /** Hash of the anchors (history fingerprint) of the first `sentHistoryLen` messages. A
+   *  resume is only valid while the incoming history still starts with that — the proof
+   *  that it was not rewound, which is why a revert no longer has to drop the link. Absent
+   *  in older entries (those are still dropped on revert). */
+  sentHash?: string;
+  /** Rewind points of the session (see `Checkpoint` in provider/history.ts), the latest
+   *  few: they survive a restart or an idle eviction, so a revert can still fork the
+   *  Claude Code session instead of replaying the history into a new one. */
+  checkpoints?: Array<{ at: number; uuid: string; sid: string; h?: string }>;
 }
 
 /** Entries older than this are dropped on write (sessions nobody resumed in a month;
  *  most of their transcripts are gone anyway). */
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_ENTRIES = 500;
+/** Rewind points kept per session in the registry. */
+const MAX_CHECKPOINTS = 48;
 
 /** Parsed registry, reused while the file's mtime is unchanged: the plugin reads it on
  *  EVERY model call (V2's `context` hook fires per step). */
@@ -105,6 +116,7 @@ export function setLink(
   convKey?: string,
   idPrefixes?: string[],
   cwd?: string,
+  history?: { sentHash?: string; checkpoints?: SessionLink["checkpoints"] },
 ): void {
   try {
     mkdirSync(DIR, { recursive: true });
@@ -120,6 +132,8 @@ export function setLink(
       ...(convKey ? { convKey } : {}),
       ...(idPrefixes?.length ? { idPrefixes: idPrefixes.slice(-8) } : {}),
       ...(cwd ? { cwd } : {}),
+      ...(history?.sentHash ? { sentHash: history.sentHash } : {}),
+      ...(history?.checkpoints?.length ? { checkpoints: history.checkpoints.slice(-MAX_CHECKPOINTS) } : {}),
     };
     atomicWriteJson(all);
   } catch {

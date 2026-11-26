@@ -171,9 +171,23 @@ export interface ClaudeCodeControl {
    * possible. Default true; `false` disables it.
    */
   smartRevert?: boolean;
+  /**
+   * How smartRevert cuts the fork: `cursor` (ACP `cursorId`, claude-agent-acp ≥ 0.109, whose
+   * fork copies the transcript with fresh uuids) or `resumeSessionAt` (older agents). Default
+   * `auto`: by the version the agent reports.
+   */
+  smartRevertFork?: "auto" | "cursor" | "resumeSessionAt";
   /** Live conversations kept open (each is a Claude Code process). Default 6. */
   maxLiveSessions?: number;
   /** Idle ms before a resumable session is closed (resumed on the next message). Default 15 min. */
+  /** Compact the session from the bridge when Claude Code didn't at `autoCompactPct`
+   *  (forks ignore the override). Default true. */
+  selfCompact?: boolean;
+  /** smartRevert: send a full replay as a hidden context-only turn followed by the prompt,
+   *  so a revert to that prompt can fork instead of replaying again (default true). */
+  splitReplay?: boolean;
+  /** Smallest replay (chars) that is split (default 20000). */
+  splitReplayMinChars?: number;
   idleSessionTtlMs?: number;
   /** Same for OpenCode subagent sessions. Default 2 min. */
   childSessionTtlMs?: number;
