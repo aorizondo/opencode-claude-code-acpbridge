@@ -5,7 +5,8 @@ import { readFileSync } from "node:fs";
 import { discoverAgent, type DiscoveredAgent } from "./discover.js";
 import { loadAnthropicCatalog, buildModelsInfo } from "./catalog.js";
 import { readCacheKeyed, writeCache } from "./cache.js";
-import { getLink, clearLink } from "./sessions.js";
+import { getLink, clearLink, listLinks } from "./sessions.js";
+import { renderSessions, selectRows, type SessionRow } from "./sessions-command.js";
 import { publishAgentRules } from "./bridge-rules.js";
 import { FALLBACK_MODES, modeAgentDefs, pairTarget, subagentDecision, isProviderModel, refString, type ModelRef, type PairingState } from "./pairing.js";
 import { detectClaudeExecutable } from "../provider/factory.js";
@@ -512,8 +513,41 @@ export const ACPPlugin = Plugin.define({
       event.input = { ...input, model: decision.model };
     });
 
+    // `/sessions-acp [all|<text>]`: the Claude Code session behind each OpenCode session and how
+    // to resume it there. Posted as a synthetic message that doesn't wake the model; the
+    // provider drops it from the history (bridge notice), so it never reaches Claude either.
+    const sessionsCommand = await ctx.command?.transform?.((editor) => {
+      editor.add({
+        name: "sessions-acp",
+        description: "Claude Code session linked to each OpenCode session, with `claude --resume` to continue it in Claude Code. `/sessions-acp all` or `/sessions-acp <text>` to filter.",
+        execute: async (input) => {
+          const arg = String((input.prompt as any)?.text ?? "").trim();
+          const links = listLinks();
+          const picked = selectRows(links as SessionRow[], arg, String(input.sessionID));
+          const rows: SessionRow[] = await Promise.all(picked.map(async (l) => {
+            try {
+              const s: any = await ctx.session.get({ sessionID: l.ocSession as any });
+              const root = s?.location?.directory ? String(s.location.directory) : undefined;
+              return { ...l, title: s?.title ? String(s.title) : undefined, directory: root && s?.subpath ? join(root, String(s.subpath)) : root };
+            } catch {
+              return { ...l, missing: true };
+            }
+          }));
+          const text = renderSessions(rows, { current: String(input.sessionID), total: links.length, arg });
+          await (ctx.session as any).synthetic({
+            sessionID: input.sessionID,
+            text,
+            description: "Claude Code sessions (acpbridge)",
+            delivery: "queue",
+            resume: false,
+          });
+        },
+      });
+    });
+
     return async () => {
       closed.abort();
+      await sessionsCommand?.dispose();
       clearTimeout(duplicateCheck);
       for (const timer of pending.values()) clearTimeout(timer);
       pending.clear();

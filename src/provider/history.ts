@@ -45,7 +45,19 @@ export function keyText(text: string): string {
  *  separately (or not at all) and OpenCode rewrites them every turn — including them
  *  would make every history comparison look like a divergence. */
 export function historyOf(prompt: Prompt): any[] {
-  return (prompt as any[]).filter((m) => m.role !== "system");
+  return (prompt as any[]).filter((m) => m.role !== "system" && !isBridgeNotice(m));
+}
+
+/** Marker opening the messages the bridge itself posts in a session for the USER (e.g. the
+ *  `/sessions-acp` table). An HTML comment: invisible once the markdown is rendered. */
+export const BRIDGE_NOTICE = "<!-- acp-notice -->";
+
+/** A message the bridge posted for the user: never part of the conversation with the agent. */
+export function isBridgeNotice(msg: any): boolean {
+  if (msg?.role !== "user") return false;
+  const c = msg.content;
+  const text = typeof c === "string" ? c : Array.isArray(c) ? c.find((p: any) => p?.type === "text")?.text : undefined;
+  return typeof text === "string" && text.trimStart().startsWith(BRIDGE_NOTICE);
 }
 
 /** Cheap, stable per-message identity. Deliberately keyed on tool-call IDs rather

@@ -53,7 +53,13 @@ export interface SessionLink {
    *  few: they survive a restart or an idle eviction, so a revert can still fork the
    *  Claude Code session instead of replaying the history into a new one. */
   checkpoints?: Array<{ at: number; uuid: string; sid: string; h?: string }>;
+  /** Earlier Claude Code sessions of this conversation (forks, replays), newest first: still
+   *  resumable with `claude --resume`, e.g. to pick up the state from before a revert. */
+  previous?: string[];
 }
+
+/** Earlier Claude Code sessions kept per conversation. */
+const MAX_PREVIOUS = 10;
 
 /** Entries older than this are dropped on write (sessions nobody resumed in a month;
  *  most of their transcripts are gone anyway). */
@@ -103,6 +109,13 @@ function atomicWriteJson(data: Record<string, SessionLink>): void {
   try { cache = { sig: signature(), data: pruned }; } catch { cache = null; }
 }
 
+/** Every link, most recently used first. */
+export function listLinks(): Array<SessionLink & { ocSession: string }> {
+  return Object.entries(readAll())
+    .map(([ocSession, l]) => ({ ...l, ocSession }))
+    .sort((a, b) => b.ts - a.ts);
+}
+
 /** Lookup the agent session linked to an OpenCode sessionID (undefined if none). */
 export function getLink(ocSession: string): SessionLink | undefined {
   return readAll()[ocSession];
@@ -135,6 +148,11 @@ export function setLink(
       ...(history?.sentHash ? { sentHash: history.sentHash } : {}),
       ...(history?.checkpoints?.length ? { checkpoints: history.checkpoints.slice(-MAX_CHECKPOINTS) } : {}),
     };
+    const previous = prev && prev.acpSessionId !== acpSessionId
+      ? [prev.acpSessionId, ...(prev.previous ?? [])]
+      : prev?.previous ?? [];
+    const kept = [...new Set(previous)].filter((id) => id && id !== acpSessionId).slice(0, MAX_PREVIOUS);
+    if (kept.length) all[ocSession].previous = kept;
     atomicWriteJson(all);
   } catch {
     /* best-effort: a missing registry just means resume won't kick in */
