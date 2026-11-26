@@ -55,15 +55,28 @@ export const BRIDGE_NOTICE = "<!-- acp-notice -->";
 /** The prompt's latest message (system ones aside) is a bridge notice: nothing for the agent. */
 export function endsWithBridgeNotice(prompt: Prompt): boolean {
   const msgs = (prompt as any[]).filter((m) => m.role !== "system");
-  return msgs.length > 0 && isBridgeNotice(msgs[msgs.length - 1]);
+  return msgs.length > 0 && msgs[msgs.length - 1].role === "user" && isBridgeNotice(msgs[msgs.length - 1]);
 }
 
-/** A message the bridge posted for the user: never part of the conversation with the agent. */
-export function isBridgeNotice(msg: any): boolean {
-  if (msg?.role !== "user") return false;
-  const c = msg.content;
+function firstText(msg: any): string | undefined {
+  const c = msg?.content;
   const text = typeof c === "string" ? c : Array.isArray(c) ? c.find((p: any) => p?.type === "text")?.text : undefined;
-  return typeof text === "string" && text.trimStart().startsWith(BRIDGE_NOTICE);
+  return typeof text === "string" ? text : undefined;
+}
+
+/** A note the bridge posted for the user (the synthetic message, or the bridge's own answer
+ *  that shows it): never part of the conversation with the agent. */
+export function isBridgeNotice(msg: any): boolean {
+  if (msg?.role !== "user" && msg?.role !== "assistant") return false;
+  if (msg.role === "assistant" && Array.isArray(msg.content) && msg.content.some((p: any) => p?.type !== "text" && p?.type !== "reasoning")) return false;
+  return firstText(msg)?.trimStart().startsWith(BRIDGE_NOTICE) ?? false;
+}
+
+/** Text of the bridge notice that ends the prompt (what the bridge answers with). */
+export function bridgeNoticeText(prompt: Prompt): string | undefined {
+  const msgs = (prompt as any[]).filter((m) => m.role !== "system");
+  const last = msgs[msgs.length - 1];
+  return last?.role === "user" && isBridgeNotice(last) ? firstText(last) : undefined;
 }
 
 /** Cheap, stable per-message identity. Deliberately keyed on tool-call IDs rather

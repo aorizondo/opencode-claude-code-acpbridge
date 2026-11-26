@@ -310,3 +310,17 @@ test("bridge notice: a turn woken only by it is answered empty, without the agen
     assert.equal(agent.log.filter((e) => e.type === "prompt").length, 0);
   } finally { done(); }
 });
+
+test("bridge notice: the table comes back as the turn's text, and both messages stay out of the history", async () => {
+  const { agent, model, done } = setup({ claudeCode: { historyMode: "v2" } });
+  try {
+    const table = "<!-- acp-notice -->\n**table**";
+    const r = run(model, opts([SYS, user("uno"), user(table)], { session: "ses_nt2" }));
+    const out = await r.done;
+    assert.match(JSON.stringify(out), /\*\*table\*\*/);
+    const t1 = run(model, opts([SYS, user("uno"), user(table), asst(table), user("dos")], { session: "ses_nt2" }));
+    const p = await agent.next("prompt");
+    assert.doesNotMatch(p.text, /table/);
+    await reply(agent, p.sessionId, t1, "R");
+  } finally { done(); }
+});

@@ -49,7 +49,7 @@ import { addAlwaysRule, evaluate as evaluateBridge } from "../plugin/bridge-rule
 import { DEBUG, logger } from "../log.js";
 import { record, recording, sanitizePrompt } from "./recorder.js";
 import {
-  anchorsHash, anchorsOf, classifyAnchors, endsWithBridgeNotice, classifyHistory, firstUserText, hashText, historyOf, isTransient, msgKey,
+  anchorsHash, anchorsOf, classifyAnchors, endsWithBridgeNotice, bridgeNoticeText, classifyHistory, firstUserText, hashText, historyOf, isTransient, msgKey,
   pickCheckpoint, prefixHash, sharedExtent, stripInjected, systemText, verifiedCheckpoint, type Checkpoint,
 } from "./history.js";
 import { lastAssistantUuid, transcriptPath, userAfter } from "./transcript.js";
@@ -506,6 +506,15 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
       const stream = new ReadableStream<LanguageModelV3StreamPart>({
         start: (controller) => {
           controller.enqueue({ type: "stream-start", warnings: [] });
+          // The UIs show a synthetic message by its description only: the note goes out as
+          // this turn's answer (it starts with the marker too, so it never reaches Claude).
+          const text = bridgeNoticeText(options.prompt);
+          if (text) {
+            const id = `notice-${Date.now()}`;
+            controller.enqueue({ type: "text-start", id });
+            controller.enqueue({ type: "text-delta", id, delta: text });
+            controller.enqueue({ type: "text-end", id });
+          }
           controller.enqueue({ type: "finish", usage: emptyUsage(), finishReason: { unified: "stop", raw: "bridge-notice" } });
           controller.close();
         },

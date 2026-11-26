@@ -55,6 +55,6 @@ export function renderSessions(rows: SessionRow[], opts: { current?: string; tot
     for (const id of cur.previous) lines.push(`- \`${resumeCommand({ acpSessionId: id, cwd: cur.cwd })}\``);
   }
   const shown = rows.length < opts.total ? ` Showing ${rows.length} of ${opts.total}: \`/sessions-acp all\` lists every one, \`/sessions-acp <text>\` filters.` : "";
-  lines.push("", `This message is not sent to the model.${shown}`);
+  lines.push("", `Shown by acpbridge: neither this table nor its request reach the model.${shown}`);
   return lines.join("\n");
 }
