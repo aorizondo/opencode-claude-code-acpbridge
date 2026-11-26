@@ -52,6 +52,12 @@ export function historyOf(prompt: Prompt): any[] {
  *  `/sessions-acp` table). An HTML comment: invisible once the markdown is rendered. */
 export const BRIDGE_NOTICE = "<!-- acp-notice -->";
 
+/** The prompt's latest message (system ones aside) is a bridge notice: nothing for the agent. */
+export function endsWithBridgeNotice(prompt: Prompt): boolean {
+  const msgs = (prompt as any[]).filter((m) => m.role !== "system");
+  return msgs.length > 0 && isBridgeNotice(msgs[msgs.length - 1]);
+}
+
 /** A message the bridge posted for the user: never part of the conversation with the agent. */
 export function isBridgeNotice(msg: any): boolean {
   if (msg?.role !== "user") return false;

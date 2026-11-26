@@ -534,12 +534,20 @@ export const ACPPlugin = Plugin.define({
             }
           }));
           const text = renderSessions(rows, { current: String(input.sessionID), total: links.length, arg });
+          // A synthetic message only shows once a turn takes it from the inbox. In a Claude Code
+          // session that turn is answered by the provider itself, empty and free (bridge notice);
+          // in another model's session it would wake that model, so it waits for the next prompt.
+          let onAcp = false;
+          try {
+            const cur: any = await ctx.session.get({ sessionID: input.sessionID as any });
+            onAcp = isProviderModel(cur?.model, providerId) || pairing.acpAgents.has(String(cur?.agent ?? ""));
+          } catch { /* unknown: don't wake anything */ }
           await (ctx.session as any).synthetic({
             sessionID: input.sessionID,
             text,
             description: "Claude Code sessions (acpbridge)",
             delivery: "queue",
-            resume: false,
+            resume: onAcp,
           });
         },
       });

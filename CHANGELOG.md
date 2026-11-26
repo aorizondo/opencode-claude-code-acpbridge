@@ -14,7 +14,9 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
   session each one is linked to, with the `claude --resume` command (and directory) to continue it in
   Claude Code — when OpenCode fails, or to pick a conversation up there. For the current session it
   also lists its earlier Claude Code sessions (forks, replays). Posted as a message that doesn't wake
-  the model and never reaches Claude (bridge notice).
+  the model and never reaches Claude (bridge notice): in a Claude Code session the turn that shows it
+  is answered by the bridge itself, empty and free; in another model's session it shows with the next
+  prompt.
 - The registry keeps the earlier Claude Code sessions of each conversation (`previous`, last 10).
 
 ## [0.13.0] — 2026-11-26

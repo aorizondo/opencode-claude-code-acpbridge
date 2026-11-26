@@ -49,7 +49,7 @@ import { addAlwaysRule, evaluate as evaluateBridge } from "../plugin/bridge-rule
 import { DEBUG, logger } from "../log.js";
 import { record, recording, sanitizePrompt } from "./recorder.js";
 import {
-  anchorsHash, anchorsOf, classifyAnchors, classifyHistory, firstUserText, hashText, historyOf, isTransient, msgKey,
+  anchorsHash, anchorsOf, classifyAnchors, endsWithBridgeNotice, classifyHistory, firstUserText, hashText, historyOf, isTransient, msgKey,
   pickCheckpoint, prefixHash, sharedExtent, stripInjected, systemText, verifiedCheckpoint, type Checkpoint,
 } from "./history.js";
 import { lastAssistantUuid, transcriptPath, userAfter } from "./transcript.js";
@@ -499,6 +499,19 @@ export class ACPOrchestratorModel implements LanguageModelV3 {
     if (modelId) this.callModel.set(options, modelId);
     const po = this.providerOptions(options);
     if (po.pairedAgent === false) throw pairingError(po.ocAgent, this.callModel.get(options) ?? this.modelId);
+    // A turn woken only by a note the bridge posted for the user (`/sessions-acp`): answered
+    // here, empty, without calling the agent — the note is for the user, not for Claude.
+    if (endsWithBridgeNotice(options.prompt)) {
+      dbg(`bridge notice only — turn answered without the agent`);
+      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+        start: (controller) => {
+          controller.enqueue({ type: "stream-start", warnings: [] });
+          controller.enqueue({ type: "finish", usage: emptyUsage(), finishReason: { unified: "stop", raw: "bridge-notice" } });
+          controller.close();
+        },
+      });
+      return { stream, warnings: [] };
+    }
     if (recording()) {
       record(this.convId(options), {
         kind: "call",

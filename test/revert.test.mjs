@@ -299,3 +299,14 @@ test("selfCompact: under the threshold nothing happens", async () => {
     assert.equal(await agent.none("prompt", 400), null, "no /compact");
   } finally { done(); }
 });
+
+test("bridge notice: a turn woken only by it is answered empty, without the agent", async () => {
+  const { agent, model, done } = setup({ claudeCode: { historyMode: "v2" } });
+  try {
+    const notice = user("<!-- acp-notice -->\n**table**");
+    const r = run(model, opts([SYS, user("uno"), asst("R1"), notice], { session: "ses_nt" }));
+    await r.done;
+    assert.equal(await agent.none("newSession", 300), null);
+    assert.equal(agent.log.filter((e) => e.type === "prompt").length, 0);
+  } finally { done(); }
+});
