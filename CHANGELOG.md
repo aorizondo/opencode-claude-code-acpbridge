@@ -8,6 +8,8 @@ All notable changes to `opencode-claude-code-acpbridge`. The format is based on
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-11-27
+
 ### Added
 
 - **`/sessions-acp`** (`all` or a filter text): a table of the OpenCode sessions and the Claude Code
